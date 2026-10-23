@@ -48,8 +48,10 @@ def _group_mode() -> bool:
     return config.ADMIN_CHAT_TYPE in ("group", "supergroup")
 
 
-async def _dm(bot: Bot, user_id: int, text: str, keyboard=None, reply_to=None, mention=None) -> bool:
-    chat_id = config.ADMIN_CHAT if _group_mode() else user_id
+async def _dm(bot: Bot, user_id: int, text: str, keyboard=None, reply_to=None,
+              mention=None, chat_id=None) -> bool:
+    if chat_id is None:
+        chat_id = config.ADMIN_CHAT if _group_mode() else user_id
     kwargs = {}
     if chat_id != user_id:
         if reply_to:
@@ -83,7 +85,7 @@ class SessionStep(BaseFilter):
         return bool(session) and session.get("step") in self.steps
 
 
-@router.callback_query(F.data.startswith("mod:"))
+@router.callback_query(F.data.startswith(("mod:pub:", "mod:col:", "mod:rej:", "mod:ban:")))
 async def card_action(callback: CallbackQuery, bot: Bot):
     if await _deny(callback):
         return
@@ -116,6 +118,7 @@ async def card_action(callback: CallbackQuery, bot: Bot):
             ]),
             reply_to=callback.message.message_id,
             mention=callback.from_user.mention_html(),
+            chat_id=callback.message.chat.id,
         )
         if not ok:
             await callback.answer("Открой бота в личке и нажми /start", show_alert=True)
@@ -157,6 +160,7 @@ async def card_action(callback: CallbackQuery, bot: Bot):
             bot, admin_id, submission_id,
             reply_to=callback.message.message_id,
             mention=callback.from_user.mention_html(),
+            chat_id=callback.message.chat.id,
         )
         if not ok:
             await callback.answer("Открой бота в личке и нажми /start", show_alert=True)
@@ -168,7 +172,7 @@ async def card_action(callback: CallbackQuery, bot: Bot):
 
 
 async def _send_collection_picker(bot: Bot, admin_id: int, submission_id: int,
-                                   reply_to=None, mention=None) -> bool:
+                                   reply_to=None, mention=None, chat_id=None) -> bool:
     rows = await db.fetchall("SELECT * FROM collections ORDER BY position, id")
     keyboard = []
     for row in rows:
@@ -179,7 +183,7 @@ async def _send_collection_picker(bot: Bot, admin_id: int, submission_id: int,
     return await _dm(
         bot, admin_id, f"Заявка #{submission_id}. В какую подборку?",
         InlineKeyboardMarkup(inline_keyboard=keyboard),
-        reply_to=reply_to, mention=mention,
+        reply_to=reply_to, mention=mention, chat_id=chat_id,
     )
 
 
@@ -196,7 +200,9 @@ async def choose_destination(callback: CallbackQuery, bot: Bot):
     if destination == "col":
         await sessions.update_session(callback.from_user.id, step="pick")
         await callback.answer()
-        await _send_collection_picker(bot, callback.from_user.id, submission_id)
+        await _send_collection_picker(
+            bot, callback.from_user.id, submission_id, chat_id=callback.message.chat.id
+        )
         return
 
     await sessions.update_session(callback.from_user.id, step="caption", collection_id=None,
@@ -204,7 +210,7 @@ async def choose_destination(callback: CallbackQuery, bot: Bot):
     await callback.answer()
     await _dm(bot, callback.from_user.id,
               f"Заявка #{submission_id}. Пришли текст подписи к посту или /skip.",
-              cancel_kb)
+              cancel_kb, chat_id=callback.message.chat.id)
 
 
 @router.callback_query(F.data.startswith("pick:"))
@@ -237,7 +243,7 @@ async def pick_collection(callback: CallbackQuery, bot: Bot):
         await callback.answer()
         await _dm(bot, admin_id,
                   f"Подборка «{collection['name']}».\nСледующая серия: S{season}E{episode}.",
-                  keyboard)
+                  keyboard, chat_id=callback.message.chat.id)
         return
 
     await sessions.set_session(admin_id, step="caption", submission_id=submission_id,
@@ -245,7 +251,7 @@ async def pick_collection(callback: CallbackQuery, bot: Bot):
     await callback.answer()
     await _dm(bot, admin_id,
               f"Подборка «{collection['name']}». Пришли текст подписи или /skip.",
-              cancel_kb)
+              cancel_kb, chat_id=callback.message.chat.id)
 
 
 @router.callback_query(F.data.startswith("picknew:"))
@@ -261,7 +267,8 @@ async def pick_new_collection(callback: CallbackQuery, bot: Bot):
     admin_id = callback.from_user.id
     await sessions.set_session(admin_id, step="newcol_name", submission_id=submission_id)
     await callback.answer()
-    await _dm(bot, admin_id, "Название новой подборки:", cancel_kb)
+    await _dm(bot, admin_id, "Название новой подборки:", cancel_kb,
+              chat_id=callback.message.chat.id)
 
 
 @router.callback_query(F.data.startswith("newcol:type:"))
@@ -290,13 +297,14 @@ async def new_collection_type(callback: CallbackQuery, bot: Bot):
                   InlineKeyboardMarkup(inline_keyboard=[
                       [_btn("✅ Ок", "ep:ok"), _btn("✏️ Изменить номер", "ep:edit")],
                       [_btn("✖️ Отмена", "flow:cancel")],
-                  ]))
+                  ]), chat_id=callback.message.chat.id)
         return
 
     await sessions.set_session(admin_id, step="caption", submission_id=submission_id,
                                collection_id=collection_id, season=None, episode=None, caption=None)
     await callback.answer()
-    await _dm(bot, admin_id, "Подборка создана. Пришли текст подписи или /skip.", cancel_kb)
+    await _dm(bot, admin_id, "Подборка создана. Пришли текст подписи или /skip.", cancel_kb,
+              chat_id=callback.message.chat.id)
 
 
 @router.callback_query(F.data == "ep:ok")
@@ -308,7 +316,7 @@ async def episode_ok(callback: CallbackQuery, bot: Bot):
         await callback.answer("Сессия устарела, начни заново", show_alert=True)
         return
     await callback.answer()
-    await _ask_caption(bot, callback.from_user.id, session)
+    await _ask_caption(bot, callback.from_user.id, session, chat_id=callback.message.chat.id)
 
 
 @router.callback_query(F.data == "ep:edit")
@@ -320,12 +328,13 @@ async def episode_edit(callback: CallbackQuery, bot: Bot):
         return
     await sessions.update_session(callback.from_user.id, step="episode")
     await callback.answer()
-    await _dm(bot, callback.from_user.id, "Введи номер серии числом:", cancel_kb)
+    await _dm(bot, callback.from_user.id, "Введи номер серии числом:", cancel_kb,
+              chat_id=callback.message.chat.id)
 
 
-async def _ask_caption(bot: Bot, admin_id: int, session: dict):
+async def _ask_caption(bot: Bot, admin_id: int, session: dict, chat_id=None):
     await sessions.update_session(admin_id, step="caption")
-    await _dm(bot, admin_id, "Пришли текст подписи или /skip.", cancel_kb)
+    await _dm(bot, admin_id, "Пришли текст подписи или /skip.", cancel_kb, chat_id=chat_id)
 
 
 @router.message(SessionStep("episode"))
@@ -342,7 +351,7 @@ async def on_episode_number(message: Message, bot: Bot):
         return
     await sessions.update_session(message.from_user.id, episode=episode)
     session = await sessions.get_session(message.from_user.id)
-    await _ask_caption(bot, message.from_user.id, session)
+    await _ask_caption(bot, message.from_user.id, session, chat_id=message.chat.id)
 
 
 @router.message(SessionStep("newcol_name"))
@@ -404,9 +413,11 @@ async def when_now(callback: CallbackQuery, bot: Bot):
         )
     except Exception as error:  # noqa: BLE001
         log.exception("publish failed")
-        await _dm(bot, admin_id, f"⚠️ Не удалось опубликовать: {esc(error)}")
+        await _dm(bot, admin_id, f"⚠️ Не удалось опубликовать: {esc(error)}",
+                  chat_id=callback.message.chat.id)
         return
-    await _dm(bot, admin_id, f"✅ Опубликовано: {result['link']}")
+    await _dm(bot, admin_id, f"✅ Опубликовано: {result['link']}",
+              chat_id=callback.message.chat.id)
 
 
 @router.callback_query(F.data == "when:later")
@@ -418,7 +429,8 @@ async def when_later(callback: CallbackQuery, bot: Bot):
         await callback.answer("Сессия устарела, начни заново", show_alert=True)
         return
     await callback.answer()
-    await _dm(bot, callback.from_user.id, "Когда публиковать?", schedule_keyboard())
+    await _dm(bot, callback.from_user.id, "Когда публиковать?", schedule_keyboard(),
+              chat_id=callback.message.chat.id)
 
 
 @router.callback_query(F.data.startswith("sched:"))
@@ -443,6 +455,7 @@ async def schedule_preset(callback: CallbackQuery, bot: Bot):
             "`25.10 18:00`, `+30m`.\n"
             f"Таймзона: {config.TIMEZONE}.",
             cancel_kb,
+            chat_id=callback.message.chat.id,
         )
         return
 
@@ -467,10 +480,12 @@ async def schedule_preset(callback: CallbackQuery, bot: Bot):
         except Exception as error:  # noqa: BLE001
             log.exception("enqueue failed")
             await callback.answer("Ошибка", show_alert=True)
-            await _dm(bot, admin_id, f"⚠️ Не удалось запланировать: {esc(error)}")
+            await _dm(bot, admin_id, f"⚠️ Не удалось запланировать: {esc(error)}",
+                      chat_id=callback.message.chat.id)
             return
         await callback.answer("Запланировано")
-        await _dm(bot, admin_id, f"🕓 Запланировано на {format_local(publish_at)}.")
+        await _dm(bot, admin_id, f"🕓 Запланировано на {format_local(publish_at)}.",
+                  chat_id=callback.message.chat.id)
         return
 
     queue_id = int(session["queue_id"])
@@ -482,7 +497,8 @@ async def schedule_preset(callback: CallbackQuery, bot: Bot):
     await db.execute("UPDATE queue SET publish_at = ? WHERE id = ?", (publish_at, queue_id))
     await sessions.clear_session(admin_id)
     await callback.answer("Время изменено")
-    await _dm(bot, admin_id, f"🕓 Новое время: {format_local(publish_at)}.")
+    await _dm(bot, admin_id, f"🕓 Новое время: {format_local(publish_at)}.",
+              chat_id=callback.message.chat.id)
     await _notify_author(bot, row["submission_id"], f"🕓 Публикация перенесена на {format_local(publish_at)}.")
 
 
@@ -691,6 +707,7 @@ async def forwarded_post(message: Message, bot: Bot):
         file_id=media.get("file_id"),
         file_unique_id=media.get("unique_id"),
         caption=caption,
+        chat_id=message.chat.id,
     )
     await message.answer(
         card,
@@ -727,7 +744,8 @@ async def fwd_add(callback: CallbackQuery, bot: Bot):
     keyboard.append([_btn("✖️ Отмена", "flow:cancel")])
     await callback.answer()
     await _dm(bot, callback.from_user.id, "В какую подборку добавить старый пост?",
-              InlineKeyboardMarkup(inline_keyboard=keyboard))
+              InlineKeyboardMarkup(inline_keyboard=keyboard),
+              chat_id=callback.message.chat.id)
 
 
 @router.callback_query(F.data.startswith("fwd:c:"))
@@ -754,7 +772,7 @@ async def fwd_choose_collection(callback: CallbackQuery, bot: Bot):
                   InlineKeyboardMarkup(inline_keyboard=[
                       [_btn("✅ Ок", "fwd:ep:ok"), _btn("✏️ Изменить номер", "fwd:ep:edit")],
                       [_btn("✖️ Отмена", "flow:cancel")],
-                  ]))
+                  ]), chat_id=callback.message.chat.id)
         return
 
     await sessions.update_session(
@@ -774,7 +792,8 @@ async def fwd_new_collection(callback: CallbackQuery, bot: Bot):
         return
     await sessions.update_session(callback.from_user.id, step="fwd_newcol_name")
     await callback.answer()
-    await _dm(bot, callback.from_user.id, "Название новой подборки:", cancel_kb)
+    await _dm(bot, callback.from_user.id, "Название новой подборки:", cancel_kb,
+              chat_id=callback.message.chat.id)
 
 
 @router.message(SessionStep("fwd_newcol_name"))
@@ -815,7 +834,7 @@ async def fwd_newcol_type(callback: CallbackQuery, bot: Bot):
                   InlineKeyboardMarkup(inline_keyboard=[
                       [_btn("✅ Ок", "fwd:ep:ok"), _btn("✏️ Изменить номер", "fwd:ep:edit")],
                       [_btn("✖️ Отмена", "flow:cancel")],
-                  ]))
+                  ]), chat_id=callback.message.chat.id)
         return
     await sessions.update_session(callback.from_user.id, step="fwd_finish",
                                   collection_id=collection_id, season=None, episode=None)
@@ -845,7 +864,8 @@ async def fwd_episode_edit(callback: CallbackQuery, bot: Bot):
         return
     await sessions.update_session(callback.from_user.id, step="fwd_episode")
     await callback.answer()
-    await _dm(bot, callback.from_user.id, "Введи номер серии числом:", cancel_kb)
+    await _dm(bot, callback.from_user.id, "Введи номер серии числом:", cancel_kb,
+              chat_id=callback.message.chat.id)
 
 
 @router.message(SessionStep("fwd_episode"))
@@ -884,7 +904,8 @@ async def _fwd_finalize(bot: Bot, admin_id: int):
         )
     except Exception as error:  # noqa: BLE001
         log.exception("cannot add existing post")
-        await _dm(bot, admin_id, f"⚠️ Не удалось добавить: {esc(error)}")
+        await _dm(bot, admin_id, f"⚠️ Не удалось добавить: {esc(error)}",
+              chat_id=session.get("chat_id"))
         return
     season = session.get("season")
     episode = session.get("episode")
@@ -895,7 +916,7 @@ async def _fwd_finalize(bot: Bot, admin_id: int):
     text = f"✅ Добавлено в {where}"
     if link:
         text += f"\n{link}"
-    await _dm(bot, admin_id, text)
+    await _dm(bot, admin_id, text, chat_id=session.get("chat_id"))
 
 
 @router.message(F.chat.id == config.ADMIN_CHAT, F.video | F.photo | F.document)

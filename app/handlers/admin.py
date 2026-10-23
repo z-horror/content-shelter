@@ -136,15 +136,16 @@ async def cb_queue_show(callback: CallbackQuery, bot: Bot):
         await callback.answer("Заявка уже обработана", show_alert=True)
         return
     card = submission["card_caption"] or f"📥 <b>Заявка #{submission_id}</b>"
+    target_chat = callback.message.chat.id
     try:
         sent = await bot.copy_message(
-            chat_id=config.ADMIN_CHAT,
+            chat_id=target_chat,
             from_chat_id=submission["source_chat_id"],
             message_id=submission["source_message_id"],
             caption=card,
             parse_mode="HTML",
             reply_markup=publishing.card_keyboard(submission_id, submission["user_id"]),
-            message_thread_id=config.ADMIN_TOPIC_ID,
+            message_thread_id=config.ADMIN_TOPIC_ID if target_chat == config.ADMIN_CHAT else None,
         )
     except Exception as error:  # noqa: BLE001
         log.warning("cannot resend submission %s: %s", submission_id, error)
@@ -152,7 +153,7 @@ async def cb_queue_show(callback: CallbackQuery, bot: Bot):
         return
     await db.execute(
         "UPDATE submissions SET admin_chat_id = ?, admin_message_id = ? WHERE id = ?",
-        (config.ADMIN_CHAT, sent.message_id, submission_id),
+        (target_chat, sent.message_id, submission_id),
     )
     await callback.answer("Отправил карточку")
 
