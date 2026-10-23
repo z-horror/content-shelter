@@ -85,6 +85,15 @@ def format_local_short(iso_value) -> str:
     return local.strftime("%d.%m %H:%M")
 
 
+def format_local_when(iso_value) -> str:
+    local = _local_dt(iso_value)
+    if local is None:
+        return "?"
+    if local.year != datetime.now(ZoneInfo(config.TIMEZONE)).year:
+        return local.strftime("%d.%m.%Y %H:%M")
+    return local.strftime("%d.%m %H:%M")
+
+
 def _to_utc(dt: datetime) -> str:
     return dt.astimezone(timezone.utc).replace(tzinfo=None).isoformat(sep=" ", timespec="seconds")
 

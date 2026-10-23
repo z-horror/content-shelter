@@ -13,7 +13,7 @@ from app import config, db, sessions
 from app.services import collections as collections_service
 from app.services import publishing
 from app.keyboards import schedule_keyboard
-from app.utils import esc, format_local, format_local_day, post_link
+from app.utils import esc, format_local, format_local_when, post_link
 
 log = logging.getLogger(__name__)
 
@@ -117,7 +117,10 @@ async def cb_queue(callback: CallbackQuery, bot: Bot):
     for row in rows:
         name = f"@{row['username']}" if row["username"] else (row["first_name"] or str(row["user_id"]))
         mark = "🎬" if row["media_type"] == "video" else "🖼"
-        keyboard.append([_btn(f"{mark} #{row['id']} · {name}", f"q:show:{row['id']}")])
+        keyboard.append([
+            _btn(f"{mark} #{row['id']} · {name} · {format_local_when(row['created_at'])}",
+                 f"q:show:{row['id']}")
+        ])
     keyboard.append([_btn("⬅️ Назад", "adm:menu")])
     await callback.message.answer(
         f"📥 Неразобранные заявки: {len(rows)}",
@@ -171,7 +174,10 @@ async def cmd_queue(message: Message):
     for row in rows:
         name = f"@{row['username']}" if row["username"] else (row["first_name"] or str(row["user_id"]))
         mark = "🎬" if row["media_type"] == "video" else "🖼"
-        keyboard.append([_btn(f"{mark} #{row['id']} · {name}", f"q:show:{row['id']}")])
+        keyboard.append([
+            _btn(f"{mark} #{row['id']} · {name} · {format_local_when(row['created_at'])}",
+                 f"q:show:{row['id']}")
+        ])
     keyboard.append([_btn("⚙️ Админка", "adm:menu")])
     await message.answer(
         f"📥 Неразобранные заявки: {len(rows)}",
@@ -193,7 +199,7 @@ async def _send_scheduled(target):
         return
     keyboard = []
     for row in rows:
-        title = f"{format_local(row['publish_at'])} · #{row['submission_id']}"
+        title = f"{format_local_when(row['publish_at'])} · #{row['submission_id']}"
         if row["collection_name"]:
             title += f" · {row['collection_name']}"
             if row["episode"]:
@@ -762,7 +768,7 @@ async def _send_post_list(target, collection_id: int, page: int):
         return
     keyboard = []
     for index, post in enumerate(rows, start=page * PAGE + 1):
-        date = format_local_day(post["published_at"])
+        date = format_local_when(post["published_at"])
         author = _admin_author(post)
         if collection["is_ordered"] and post["episode"]:
             label = f"S{int(post['season'] or 1)}E{int(post['episode'])} · {date} · {author}"

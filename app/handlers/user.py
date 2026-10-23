@@ -23,8 +23,8 @@ from app import config, db
 from app.services import link_download, link_flow
 from app.services import submissions as submissions_service
 from app.services.publishing import card_keyboard, random_keyboard
-from app.utils import (esc, format_local, format_local_day, format_local_short,
-                       human_duration, human_size, now_iso, post_link)
+from app.utils import (esc, format_local, format_local_when, human_duration,
+                       human_size, now_iso, post_link)
 
 log = logging.getLogger(__name__)
 
@@ -417,6 +417,16 @@ def _author_label(row):
     return "из канала"
 
 
+def _author_for_viewer(row, viewer_id):
+    if not row["author_id"]:
+        return "из канала"
+    if config.is_admin(viewer_id):
+        return _author_label(row)
+    if row["author_id"] == viewer_id:
+        return "вы"
+    return "скрыт"
+
+
 def _series_label(season, episode, default_season=1):
     if not episode:
         return ""
@@ -440,7 +450,7 @@ async def _collection_page(collection_id: int, page: int):
     return total, rows
 
 
-def _render_collection(collection, rows, total, page):
+def _render_collection(collection, rows, total, page, viewer_id):
     icon = "📺" if collection["is_ordered"] else "📁"
     if collection["is_ordered"]:
         count = f"{total} {_plural(total, 'серия', 'серии', 'серий')}"
@@ -448,8 +458,8 @@ def _render_collection(collection, rows, total, page):
         count = f"{total} {_plural(total, 'пост', 'поста', 'постов')}"
     lines = [f"{icon} <b>{esc(collection['name'])}</b>", count, ""]
     for index, row in enumerate(rows, start=page * PAGE_SIZE + 1):
-        date = format_local_day(row["published_at"])
-        author = esc(_author_label(row))
+        date = format_local_when(row["published_at"])
+        author = esc(_author_for_viewer(row, viewer_id))
         link = post_link(row["message_id"])
         if collection["is_ordered"] and row["episode"]:
             label = _series_label(row["season"], row["episode"], collection["season"])
@@ -499,7 +509,7 @@ async def cb_collection(callback: CallbackQuery):
     total, rows = await _collection_page(collection_id, page)
     await callback.answer()
     await callback.message.answer(
-        _render_collection(collection, rows, total, page),
+        _render_collection(collection, rows, total, page, callback.from_user.id),
         reply_markup=_collection_keyboard(collection, total, page),
     )
 
@@ -520,9 +530,13 @@ async def cb_collection_all(callback: CallbackQuery, bot: Bot):
     await callback.answer()
 
     chat_id = callback.message.chat.id
+    back = InlineKeyboardMarkup(inline_keyboard=[
+        [_btn("⬅️ К подборке", f"u:c:{collection_id}:{page}")],
+    ])
     if len(rows) == 1:
         row = rows[0]
         await bot.copy_message(chat_id, row["channel_id"], row["message_id"])
+        await bot.send_message(chat_id, "Готово.", reply_markup=back)
         return
 
     media = []
@@ -541,6 +555,7 @@ async def cb_collection_all(callback: CallbackQuery, bot: Bot):
                 await bot.copy_message(chat_id, row["channel_id"], row["message_id"])
             except TelegramBadRequest:
                 continue
+    await bot.send_message(chat_id, "Готово.", reply_markup=back)
 
 
 async def send_random(message: Message, bot: Bot):
@@ -638,18 +653,18 @@ async def _my_row(user_id, submission_id):
 def _my_line(row):
     status = row["status"]
     if status == "scheduled":
-        when = format_local_short(row["publish_at"]) if row["publish_at"] else format_local_day(row["created_at"])
+        when = format_local_when(row["publish_at"] or row["created_at"])
         episode = _series_label(row["sched_season"], row["sched_episode"])
         return f"#{row['id']} · 🕓 {when}{(' · ' + episode) if episode else ''}", None
     if status == "approved":
-        when = format_local_day(row["post_published_at"] or row["created_at"])
+        when = format_local_when(row["post_published_at"] or row["created_at"])
         episode = _series_label(row["post_season"], row["post_episode"])
         text = f"#{row['id']} · ✅ {when}{(' · ' + episode) if episode else ''}"
         link = post_link(row["post_message_id"]) if row["post_message_id"] else None
         return text, link
     if status == "rejected":
-        return f"#{row['id']} · ❌ {format_local_day(row['created_at'])}", None
-    return f"#{row['id']} · ⏳ {format_local_day(row['created_at'])}", None
+        return f"#{row['id']} · ❌ {format_local_when(row['created_at'])}", None
+    return f"#{row['id']} · ⏳ {format_local_when(row['created_at'])}", None
 
 
 async def show_my(message: Message):
@@ -694,7 +709,7 @@ async def _show_my_list(message: Message, user_id: int, page: int):
         emoji = STATUS_EMOJI.get(row["status"], "•")
         keyboard.append([
             _btn(
-                f"#{row['id']} · {emoji} {format_local_day(row['created_at'])}",
+                f"#{row['id']} · {emoji} {format_local_when(row['created_at'])}",
                 f"u:mycard:{row['id']}:{page}",
             )
         ])
