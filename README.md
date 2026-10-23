@@ -1,4 +1,4 @@
-# Neuroslop Bot
+# Content Shelter
 
 Telegram-бот для канала с мемами и мини-сериалами. Один бот делает две вещи:
 
@@ -82,7 +82,7 @@ Telegram-бот для канала с мемами и мини-сериалам
 ## Установка
 
 ```bash
-git clone https://github.com/z-horror/neuroslop-bot.git neuroslop-bot
+git clone https://github.com/z-horror/content-shelter.git neuroslop-bot
 cd neuroslop-bot
 ./deploy/install.sh
 ```
