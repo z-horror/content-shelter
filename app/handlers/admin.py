@@ -53,14 +53,15 @@ def _btn(text, data=None, url=None):
     return InlineKeyboardButton(text=text, callback_data=data)
 
 
-def menu_keyboard():
+async def menu_keyboard():
+    pending = int(await db.fetchval("SELECT COUNT(*) FROM submissions WHERE status = 'pending'", default=0))
+    scheduled = int(await db.fetchval("SELECT COUNT(*) FROM queue WHERE status = 'waiting'", default=0))
+    queue_label = "📥 Очередь" + (f" ({pending})" if pending else "")
+    plan_label = "🗓 Отложено" + (f" ({scheduled})" if scheduled else "")
     return InlineKeyboardMarkup(inline_keyboard=[
-        [_btn("📥 Очередь", "adm:queue")],
-        [_btn("🗓 Запланировано", "adm:sched")],
-        [_btn("📊 Статистика", "adm:stats")],
-        [_btn("📁 Подборки", "adm:cols")],
-        [_btn("⚙️ Настройки", "adm:set")],
-        [_btn("🔧 Сервис", "adm:svc")],
+        [_btn(queue_label, "adm:queue"), _btn(plan_label, "adm:sched")],
+        [_btn("📁 Подборки", "adm:cols"), _btn("⚙️ Настройки", "adm:set")],
+        [_btn("📊 Статистика", "adm:stats"), _btn("🔧 Сервис", "adm:svc")],
         [_btn("⬅️ В меню", "u:menu")],
     ])
 
@@ -68,7 +69,7 @@ def menu_keyboard():
 @router.message(Command("admin"), IsAdmin())
 async def cmd_admin(message: Message, state: FSMContext):
     await state.clear()
-    await message.answer("⚙️ Админка", reply_markup=menu_keyboard())
+    await message.answer("⚙️ Админка", reply_markup=await menu_keyboard())
 
 
 @router.message(CommandStart(), F.chat.type.in_({"group", "supergroup"}))
@@ -88,7 +89,7 @@ async def cmd_id(message: Message):
 async def cb_admin_menu(callback: CallbackQuery, state: FSMContext):
     await state.clear()
     await callback.answer()
-    await callback.message.answer("⚙️ Админка", reply_markup=menu_keyboard())
+    await callback.message.answer("⚙️ Админка", reply_markup=await menu_keyboard())
 
 
 @router.callback_query(F.data == "adm:queue", IsAdmin())
@@ -563,7 +564,7 @@ async def cb_new_collection_type(callback: CallbackQuery, state: FSMContext):
 async def cb_admin_cancel(callback: CallbackQuery, state: FSMContext):
     await state.clear()
     await callback.answer("Отменено")
-    await callback.message.answer("Отменено.", reply_markup=menu_keyboard())
+    await callback.message.answer("Отменено.", reply_markup=await menu_keyboard())
 
 
 async def _settings_view():
@@ -643,4 +644,4 @@ async def on_setting_value(message: Message, state: FSMContext):
             return
     await db.set_setting(key, raw)
     await state.clear()
-    await message.answer(f"«{label}» обновлено.", reply_markup=menu_keyboard())
+    await message.answer(f"«{label}» обновлено.", reply_markup=await menu_keyboard())
