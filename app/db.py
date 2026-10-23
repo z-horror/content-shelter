@@ -1,3 +1,4 @@
+import contextlib
 import glob
 import logging
 from pathlib import Path
@@ -9,6 +10,7 @@ from app import config
 log = logging.getLogger(__name__)
 
 _conn: aiosqlite.Connection | None = None
+_tx_depth = 0
 
 
 def conn() -> aiosqlite.Connection:
@@ -25,6 +27,7 @@ async def init():
     _conn.row_factory = aiosqlite.Row
     await _conn.execute("PRAGMA journal_mode=WAL")
     await _conn.execute("PRAGMA foreign_keys=ON")
+    await _conn.execute("PRAGMA busy_timeout=5000")
     await _conn.commit()
     await _migrate()
     log.info("database ready: %s", path)
@@ -55,9 +58,15 @@ async def _migrate():
             continue
         sql = Path(filename).read_text(encoding="utf-8")
         log.info("applying migration %s", Path(filename).name)
-        await conn().executescript(sql)
-        await conn().execute(f"PRAGMA user_version = {number}")
-        await conn().commit()
+        script = f"BEGIN;\n{sql}\nPRAGMA user_version = {number};\nCOMMIT;"
+        try:
+            await conn().executescript(script)
+        except Exception:
+            try:
+                await conn().rollback()
+            except Exception:  # noqa: BLE001
+                log.exception("rollback after failed migration %s failed", filename)
+            raise
         version = number
 
 
@@ -82,8 +91,38 @@ async def fetchval(sql, params=(), default=None):
 
 async def execute(sql, params=()):
     cur = await conn().execute(sql, params)
-    await conn().commit()
+    if _tx_depth == 0:
+        await conn().commit()
     return cur
+
+
+@contextlib.asynccontextmanager
+async def transaction():
+    """Атомарная группа записей. Внутри нельзя делать сетевые вызовы."""
+    global _tx_depth
+    if _tx_depth > 0:
+        yield
+        return
+
+    await conn().execute("BEGIN IMMEDIATE")
+    _tx_depth = 1
+    try:
+        yield
+    except BaseException:
+        _tx_depth = 0
+        await conn().rollback()
+        raise
+    else:
+        try:
+            await conn().commit()
+        except BaseException:
+            try:
+                await conn().rollback()
+            except Exception:  # noqa: BLE001
+                log.exception("rollback after failed commit failed")
+            raise
+        finally:
+            _tx_depth = 0
 
 
 async def get_setting(key, default=None):
