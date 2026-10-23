@@ -23,13 +23,29 @@ docker compose logs --tail=50
 
 ```bash
 git log --oneline -3
+# обязательно: нет ли незавершённых публикаций (см. ниже)
+docker compose run --rm --no-deps -T bot python - <<'SCRIPT'
+import sqlite3
+c = sqlite3.connect("/data/neuroslop.sqlite3")
+print("claims:", list(c.execute("SELECT id, publishing_at FROM submissions WHERE publishing_at IS NOT NULL")))
+print("queue:", list(c.execute("SELECT id, submission_id, status FROM queue WHERE status IN ('processing', 'unknown')")))
+SCRIPT
+docker compose stop bot
 git reset --hard <предыдущий-коммит>
 docker compose up -d --build
 ```
 
-Миграции применяются автоматически при старте. Откат кода **не откатывает**
-схему БД: старый код совместим с новыми колонками, но после появления новых
-данных восстановление старого бэкапа приведёт к их потере.
+**Перед откатом на старый код проверь незавершённые публикации.** Старый
+планировщик возвращает `processing` в `waiting` и может опубликовать повторно.
+Проверка выполняется одноразовым контейнером, поэтому работает и когда бот
+остановлен или падает при старте. Если записи есть — сначала разбери их по
+разделу «Диагностика незавершённых публикаций», только потом запускай старый код.
+
+Миграции применяются автоматически при старте; в логах должно быть
+`applying migration 003_publish_claim.sql`. Откат кода **не откатывает**
+схему БД: старый код совместим с новыми колонками (проверено на копии схемы v3),
+но после появления новых данных восстановление старого бэкапа приведёт к их
+потере.
 
 ## Проверка бэкапа
 
