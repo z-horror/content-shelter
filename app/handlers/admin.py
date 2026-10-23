@@ -390,7 +390,36 @@ async def cb_service(callback: CallbackQuery, bot: Bot):
     except Exception as error:  # noqa: BLE001
         lines.append(f"Админ-чат: ❌ {error}")
     lines.append(f"Бот: @{config.BOT_USERNAME}")
-    await callback.message.answer("\n".join(lines))
+    await callback.message.answer(
+        "\n".join(lines),
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [_btn("🔁 Пересобрать кнопки", "svc:kb")],
+            [_btn("⬅️ Назад", "adm:menu")],
+        ]),
+    )
+
+
+@router.callback_query(F.data == "svc:kb", IsAdmin())
+async def cb_rebuild_confirm(callback: CallbackQuery):
+    await callback.answer()
+    await callback.message.answer(
+        "Пересобрать кнопки у всех постов?\n"
+        "Нужно после смены username бота, чтобы старые кнопки вели на новый адрес.",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [_btn("🔁 Да, пересобрать", "svc:kb:ok")],
+            [_btn("⬅️ Отмена", "adm:svc")],
+        ]),
+    )
+
+
+@router.callback_query(F.data == "svc:kb:ok", IsAdmin())
+async def cb_rebuild_ok(callback: CallbackQuery, bot: Bot):
+    await callback.answer("Обновляю...")
+    await callback.message.answer("Обновляю кнопки, это может занять минуту...")
+    updated, failed = await publishing.rebuild_all_keyboards(bot)
+    await callback.message.answer(
+        f"Готово. Обновлено: {updated}. Не удалось (не посты бота): {failed}."
+    )
 
 
 @router.callback_query(F.data == "adm:cols", IsAdmin())

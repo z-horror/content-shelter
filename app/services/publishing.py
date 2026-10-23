@@ -1,3 +1,4 @@
+import asyncio
 import logging
 
 from aiogram import Bot
@@ -314,3 +315,28 @@ async def add_existing_post(
     await refresh_keyboard(bot, previous)
     await refresh_keyboard(bot, following)
     return post_id
+
+
+async def rebuild_all_keyboards(bot: Bot):
+    """Пересобрать клавиатуры у всех постов (после смены username бота)."""
+    rows = await db.fetchall("SELECT * FROM posts ORDER BY id")
+    random_enabled = await db.get_bool_setting("random_button_under_posts")
+    updated = 0
+    failed = 0
+    for post in rows:
+        prev_link = next_link = None
+        if post["collection_id"] and post["episode"]:
+            previous, following = await neighbour_posts(post)
+            prev_link = post_link(previous["message_id"]) if previous else None
+            next_link = post_link(following["message_id"]) if following else None
+        try:
+            await bot.edit_message_reply_markup(
+                chat_id=post["channel_id"],
+                message_id=post["message_id"],
+                reply_markup=post_keyboard(prev_link, next_link, random_enabled),
+            )
+            updated += 1
+        except TelegramBadRequest:
+            failed += 1
+        await asyncio.sleep(0.05)
+    return updated, failed
