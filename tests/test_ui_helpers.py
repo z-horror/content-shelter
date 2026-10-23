@@ -1,4 +1,4 @@
-from app.handlers import user
+from app.handlers import admin, user
 from app.utils import format_local_day, format_local_short
 
 
@@ -82,3 +82,12 @@ def test_render_collection_series_and_folder():
 def test_date_helpers():
     assert format_local_day("2026-10-24 12:00:00") == "24.10"
     assert format_local_short("2026-10-24 12:00:00") == "24.10 15:00"
+
+
+def test_admin_helpers():
+    assert admin._admin_plain_title("<b>Смешное</b>\nhttps://x") == "Смешное"
+    assert admin._admin_plain_title("https://x") is None
+    assert admin._admin_author({"username": "user", "first_name": "User"}) == "@user"
+    assert admin._admin_author({"username": None, "first_name": "User"}) == "User"
+    assert admin._admin_author({"username": None, "first_name": None}) == "из канала"
+    assert admin._admin_plural(1, "серия", "серии", "серий") == "серия"

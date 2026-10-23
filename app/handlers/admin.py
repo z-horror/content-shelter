@@ -1,4 +1,6 @@
+import html
 import logging
+import re
 
 from aiogram import Bot, F, Router
 from aiogram.exceptions import TelegramBadRequest
@@ -11,7 +13,7 @@ from app import config, db, sessions
 from app.services import collections as collections_service
 from app.services import publishing
 from app.keyboards import schedule_keyboard
-from app.utils import esc, format_local, post_link
+from app.utils import esc, format_local, format_local_day, post_link
 
 log = logging.getLogger(__name__)
 
@@ -442,7 +444,7 @@ async def cb_collections(callback: CallbackQuery, state: FSMContext):
     await callback.answer()
     rows = await db.fetchall(
         "SELECT c.*, (SELECT COUNT(*) FROM posts p WHERE p.collection_id = c.id AND p.is_deleted = 0) AS cnt "
-        "FROM collections c ORDER BY c.position, c.id"
+        "FROM collections c ORDER BY c.is_ordered DESC, c.position, c.id"
     )
     keyboard = []
     for row in rows:
@@ -450,7 +452,7 @@ async def cb_collections(callback: CallbackQuery, state: FSMContext):
         keyboard.append([_btn(f"{mark} {row['name']} ({row['cnt']})", f"ac:v:{row['id']}")])
     keyboard.append([_btn("➕ Новая подборка", "ac:new")])
     keyboard.append([_btn("⬅️ Назад", "adm:menu")])
-    await callback.message.answer("📁 Подборки:", reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard))
+    await callback.message.answer("📚 Подборки:", reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard))
 
 
 @router.callback_query(F.data.startswith("ac:v:"), IsAdmin())
@@ -466,12 +468,14 @@ async def cb_collection_view(callback: CallbackQuery):
         (collection_id,),
         default=0,
     )
+    icon = "📺" if row["is_ordered"] else "📁"
     kind = "сериал" if row["is_ordered"] else "папка"
+    count_label = "Серий" if row["is_ordered"] else "Постов"
     text = (
-        f"📁 <b>{esc(row['name'])}</b>\n"
+        f"{icon} <b>{esc(row['name'])}</b>\n"
         f"Тип: {kind}\n"
         f"Хештег: #{row['slug']}\n"
-        f"Постов: {count}"
+        f"{count_label}: {count}"
     )
     toggle_text = "📁 Сделать папкой" if row["is_ordered"] else "📺 Сделать сериалом"
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
@@ -706,6 +710,36 @@ async def on_setting_value(message: Message, state: FSMContext):
 PAGE = 10
 
 
+def _admin_plural(number: int, one: str, few: str, many: str) -> str:
+    if number % 10 == 1 and number % 100 != 11:
+        return one
+    if number % 10 in (2, 3, 4) and number % 100 not in (12, 13, 14):
+        return few
+    return many
+
+
+def _admin_plain_title(caption):
+    if not caption:
+        return None
+    text = html.unescape(re.sub(r"<[^>]+>", "", caption))
+    for line in text.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        if line.startswith("#") or re.match(r"^https?://", line):
+            return None
+        return line[:40]
+    return None
+
+
+def _admin_author(post):
+    if post["username"]:
+        return f"@{post['username']}"
+    if post["first_name"]:
+        return post["first_name"]
+    return "из канала"
+
+
 async def _send_post_list(target, collection_id: int, page: int):
     collection = await db.fetchone("SELECT * FROM collections WHERE id = ?", (collection_id,))
     if collection is None:
@@ -716,25 +750,31 @@ async def _send_post_list(target, collection_id: int, page: int):
     ))
     page = max(0, page)
     rows = await db.fetchall(
-        "SELECT * FROM posts WHERE collection_id = ? ORDER BY COALESCE(season, 0), "
-        "COALESCE(episode, 0), id LIMIT ? OFFSET ?",
+        "SELECT p.*, u.username, u.first_name FROM posts p "
+        "LEFT JOIN users u ON u.id = p.author_id "
+        "WHERE p.collection_id = ? ORDER BY COALESCE(p.season, 0), "
+        "COALESCE(p.episode, 0), p.id LIMIT ? OFFSET ?",
         (collection_id, PAGE, page * PAGE),
     )
     if not rows:
         await target.answer("В подборке пока нет постов.")
         return
     keyboard = []
-    row = []
-    for post in rows:
-        label = f"S{int(post['season'] or 1)}E{int(post['episode'])}" if post["episode"] else f"#{post['id']}"
+    for index, post in enumerate(rows, start=page * PAGE + 1):
+        date = format_local_day(post["published_at"])
+        author = _admin_author(post)
+        if collection["is_ordered"] and post["episode"]:
+            label = f"S{int(post['season'] or 1)}E{int(post['episode'])} · {date} · {author}"
+        else:
+            kind = "🎬" if post["media_type"] == "video" else "🖼"
+            title = _admin_plain_title(post["caption"])
+            if title:
+                label = f"{index}. {kind} «{title}» · {date}"
+            else:
+                label = f"{index}. {kind} без названия · {date}"
         if post["is_deleted"]:
             label = "🙈 " + label
-        row.append(_btn(label, f"ap:v:{post['id']}:{collection_id}:{page}"))
-        if len(row) == 2:
-            keyboard.append(row)
-            row = []
-    if row:
-        keyboard.append(row)
+        keyboard.append([_btn(label, f"ap:v:{post['id']}:{collection_id}:{page}")])
     navigation = []
     if page > 0:
         navigation.append(_btn("⬅️", f"ap:list:{collection_id}:{page - 1}"))
@@ -743,9 +783,11 @@ async def _send_post_list(target, collection_id: int, page: int):
     if navigation:
         keyboard.append(navigation)
     keyboard.append([_btn("⬅️ К подборке", f"ac:v:{collection_id}")])
+    icon = "📺" if collection["is_ordered"] else "📁"
+    unit = _admin_plural(total, "серия", "серии", "серий") if collection["is_ordered"] else _admin_plural(total, "пост", "поста", "постов")
     await target.answer(
-        f"📄 <b>{esc(collection['name'])}</b> · постов: {total}\n"
-        "Нажми на серию, чтобы открыть карточку поста.",
+        f"{icon} <b>{esc(collection['name'])}</b> · {total} {unit}\n"
+        "Нажми на запись, чтобы открыть карточку поста.",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard),
     )
 
@@ -760,9 +802,15 @@ async def _send_post_card(target, post_id: int, collection_id: int, page: int):
         collection = await db.fetchone("SELECT * FROM collections WHERE id = ?", (post["collection_id"],))
     lines = ["📄 Карточка поста"]
     if collection is not None:
-        lines.append(f"Подборка: {esc(collection['name'])}")
+        icon = "📺" if collection["is_ordered"] else "📁"
+        lines.append(f"Подборка: {icon} {esc(collection['name'])}")
     if post["episode"]:
         lines.append(f"Серия: S{int(post['season'] or 1)}E{int(post['episode'])}")
+    author = await db.fetchone(
+        "SELECT username, first_name FROM users WHERE id = ?", (post["author_id"],)
+    ) if post["author_id"] else None
+    if author is not None:
+        lines.append(f"Автор: {esc(_admin_author(author))}")
     lines.append(f"Опубликован: {format_local(post['published_at'])}")
     if post["is_deleted"]:
         lines.append("🙈 Скрыт из подборок")
