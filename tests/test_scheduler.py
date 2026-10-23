@@ -14,7 +14,15 @@ async def _seed_queue(submission_id, status="processing"):
     )
 
 
-def test_recovery_marks_done_and_unknown_without_requeue():
+async def _seed_post(submission_id, message_id):
+    await db.execute(
+        "INSERT INTO posts (channel_id, message_id, submission_id, media_type, published_at) "
+        "VALUES (-1001111111111, ?, ?, 'video', ?)",
+        (message_id, submission_id, now_iso()),
+    )
+
+
+def test_recovery_marks_done_and_reconciles_submission():
     async def scenario():
         await db.init()
         try:
@@ -22,11 +30,7 @@ def test_recovery_marks_done_and_unknown_without_requeue():
             unknown_id = await seed_submission(2)
             await _seed_queue(done_id)
             await _seed_queue(unknown_id)
-            await db.execute(
-                "INSERT INTO posts (channel_id, message_id, submission_id, media_type, published_at) "
-                "VALUES (-1001111111111, 777, ?, 'video', ?)",
-                (done_id, now_iso()),
-            )
+            await _seed_post(done_id, 777)
 
             bot = FakeBot()
             await _recover(bot)
@@ -37,10 +41,64 @@ def test_recovery_marks_done_and_unknown_without_requeue():
             }
             assert statuses[done_id] == "done"
             assert statuses[unknown_id] == "unknown"
-            assert await db.fetchval(
-                "SELECT COUNT(*) FROM queue WHERE status = 'waiting'"
-            ) == 0
+            assert await db.fetchval("SELECT COUNT(*) FROM queue WHERE status = 'waiting'") == 0
             assert any("незавершённые публикации" in text for _, text in bot.messages)
+
+            done = await db.fetchone("SELECT * FROM submissions WHERE id = ?", (done_id,))
+            assert done["status"] == "approved"
+            assert done["publishing_at"] is None
+            assert await db.fetchval("SELECT approved_total FROM users WHERE id = 1") == 1
+
+            pending = await db.fetchone("SELECT * FROM submissions WHERE id = ?", (unknown_id,))
+            assert pending["status"] == "pending"
+            assert pending["publishing_at"] is None
+        finally:
+            await db.close()
+
+    asyncio.run(scenario())
+
+
+def test_recovery_clears_claim_when_post_exists():
+    async def scenario():
+        await db.init()
+        try:
+            submission_id = await seed_submission(1)
+            await db.execute(
+                "UPDATE submissions SET publishing_at = ? WHERE id = ?", (now_iso(), submission_id)
+            )
+            await _seed_post(submission_id, 888)
+
+            await _recover(FakeBot())
+
+            submission = await db.fetchone("SELECT * FROM submissions WHERE id = ?", (submission_id,))
+            assert submission["status"] == "approved"
+            assert submission["publishing_at"] is None
+            assert await db.fetchval("SELECT approved_total FROM users WHERE id = 1") == 1
+        finally:
+            await db.close()
+
+    asyncio.run(scenario())
+
+
+def test_recovery_keeps_claim_when_result_unknown():
+    async def scenario():
+        await db.init()
+        try:
+            submission_id = await seed_submission(1, status="scheduled")
+            await db.execute(
+                "UPDATE submissions SET publishing_at = ? WHERE id = ?", (now_iso(), submission_id)
+            )
+            await _seed_queue(submission_id)
+
+            bot = FakeBot()
+            await _recover(bot)
+
+            submission = await db.fetchone("SELECT * FROM submissions WHERE id = ?", (submission_id,))
+            assert submission["status"] == "scheduled"
+            assert submission["publishing_at"] is not None
+            queue_row = await db.fetchone("SELECT * FROM queue WHERE submission_id = ?", (submission_id,))
+            assert queue_row["status"] == "unknown"
+            assert await db.fetchval("SELECT COUNT(*) FROM posts") == 0
         finally:
             await db.close()
 

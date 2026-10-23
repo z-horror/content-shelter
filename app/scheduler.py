@@ -3,6 +3,7 @@ import logging
 
 from aiogram import Bot
 from app import config, db
+from app.services import collections as collections_service
 from app.services import publishing
 from app.utils import format_local, now_iso
 
@@ -17,14 +18,52 @@ async def _notify_admins(bot: Bot, text: str):
             log.warning("cannot notify admin %s", admin_id)
 
 
+async def _reconcile_published(submission_id: int, post) -> bool:
+    """Пост уже в базе: приводим заявку к approved и снимаем резерв.
+
+    Счётчик и номер серии увеличиваем только если заявка ещё не approved:
+    при старом порядке записи (пост → статус → счётчик) это доказуемо
+    означает, что счётчик не был увеличен.
+    """
+    submission = await db.fetchone("SELECT * FROM submissions WHERE id = ?", (submission_id,))
+    if submission is None:
+        return False
+
+    async with db.transaction():
+        if submission["status"] != "approved":
+            await db.execute(
+                "UPDATE submissions SET status = 'approved', publishing_at = NULL, "
+                "reviewed_at = COALESCE(reviewed_at, ?) WHERE id = ?",
+                (now_iso(), submission_id),
+            )
+            await db.execute(
+                "UPDATE users SET approved_total = approved_total + 1 WHERE id = ?",
+                (submission["user_id"],),
+            )
+            if post["collection_id"] and post["episode"]:
+                await collections_service.bump_episode(post["collection_id"], post["episode"])
+            log.warning(
+                "reconciled submission %s as approved: post %s exists, counters adjusted",
+                submission_id, post["message_id"],
+            )
+        else:
+            await db.execute(
+                "UPDATE submissions SET publishing_at = NULL WHERE id = ?", (submission_id,)
+            )
+    return True
+
+
 async def _recover(bot: Bot):
+
     rows = await db.fetchall("SELECT * FROM queue WHERE status = 'processing'")
     unknown = []
     for row in rows:
-        post_exists = await db.fetchval(
-            "SELECT 1 FROM posts WHERE submission_id = ?", (row["submission_id"],)
+        post = await db.fetchone(
+            "SELECT * FROM posts WHERE submission_id = ? ORDER BY id LIMIT 1",
+            (row["submission_id"],),
         )
-        if post_exists:
+        if post is not None:
+            await _reconcile_published(row["submission_id"], post)
             await db.execute(
                 "UPDATE queue SET status = 'done', error = NULL WHERE id = ?", (row["id"],)
             )
@@ -44,9 +83,17 @@ async def _recover(bot: Bot):
         "SELECT id, publishing_at FROM submissions WHERE publishing_at IS NOT NULL"
     )
     for claim in claims:
-        log.warning(
-            "stale publish claim: submission=%s since=%s", claim["id"], claim["publishing_at"]
+        post = await db.fetchone(
+            "SELECT * FROM posts WHERE submission_id = ? ORDER BY id LIMIT 1", (claim["id"],)
         )
+        if post is not None:
+            await _reconcile_published(claim["id"], post)
+            log.info("publish claim for submission %s cleared: post exists", claim["id"])
+        else:
+            log.warning(
+                "stale publish claim: submission=%s since=%s",
+                claim["id"], claim["publishing_at"],
+            )
 
     if unknown:
         ids = ", ".join(f"#{row['submission_id']}" for row in unknown)
