@@ -2,8 +2,6 @@ import asyncio
 import logging
 
 from aiogram import Bot
-from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError
-
 from app import config, db
 from app.services import publishing
 from app.utils import format_local, now_iso
@@ -15,8 +13,48 @@ async def _notify_admins(bot: Bot, text: str):
     for admin_id in config.ADMIN_USER_IDS:
         try:
             await bot.send_message(admin_id, text, parse_mode=None)
-        except (TelegramForbiddenError, TelegramBadRequest):
-            pass
+        except Exception:  # noqa: BLE001
+            log.warning("cannot notify admin %s", admin_id)
+
+
+async def _recover(bot: Bot):
+    rows = await db.fetchall("SELECT * FROM queue WHERE status = 'processing'")
+    unknown = []
+    for row in rows:
+        post_exists = await db.fetchval(
+            "SELECT 1 FROM posts WHERE submission_id = ?", (row["submission_id"],)
+        )
+        if post_exists:
+            await db.execute(
+                "UPDATE queue SET status = 'done', error = NULL WHERE id = ?", (row["id"],)
+            )
+            log.info("queue %s recovered as done (post exists)", row["id"])
+        else:
+            await db.execute(
+                "UPDATE queue SET status = 'unknown', error = ? WHERE id = ?",
+                ("прервано во время публикации; результат неизвестен", row["id"]),
+            )
+            unknown.append(row)
+            log.error(
+                "queue %s recovered as unknown: submission=%s scheduled=%s",
+                row["id"], row["submission_id"], row["publish_at"],
+            )
+
+    claims = await db.fetchall(
+        "SELECT id, publishing_at FROM submissions WHERE publishing_at IS NOT NULL"
+    )
+    for claim in claims:
+        log.warning(
+            "stale publish claim: submission=%s since=%s", claim["id"], claim["publishing_at"]
+        )
+
+    if unknown:
+        ids = ", ".join(f"#{row['submission_id']}" for row in unknown)
+        await _notify_admins(
+            bot,
+            f"⚠️ После перезапуска найдены незавершённые публикации: {ids}.\n"
+            "Результат неизвестен, автоповтор остановлен. Проверь канал и очередь вручную.",
+        )
 
 
 async def _process(row, bot: Bot):
@@ -31,6 +69,19 @@ async def _process(row, bot: Bot):
         )
         await db.execute("UPDATE queue SET status = 'done' WHERE id = ?", (row["id"],))
         log.info("scheduled submission %s published", row["submission_id"])
+    except (publishing.PublishBusy, publishing.PublishAmbiguous) as error:
+        log.error(
+            "scheduled publish stopped for queue %s: %s", row["id"], type(error).__name__
+        )
+        await db.execute(
+            "UPDATE queue SET status = 'unknown', error = ? WHERE id = ?",
+            (str(error)[:500], row["id"]),
+        )
+        await _notify_admins(
+            bot,
+            f"⚠️ Заявка #{row['submission_id']}: публикация не завершена "
+            f"({type(error).__name__}). Автоповтор остановлен, проверь канал.",
+        )
     except Exception as error:  # noqa: BLE001
         log.exception("scheduled publish failed for queue %s", row["id"])
         attempts = int(row["attempts"] or 0) + 1
@@ -53,11 +104,7 @@ async def _process(row, bot: Bot):
 
 async def scheduler_loop(bot: Bot):
     try:
-        await db.execute(
-            "UPDATE queue SET status = 'done' WHERE status = 'processing' AND submission_id IN "
-            "(SELECT id FROM submissions WHERE status = 'approved')"
-        )
-        await db.execute("UPDATE queue SET status = 'waiting' WHERE status = 'processing'")
+        await _recover(bot)
     except Exception:  # noqa: BLE001
         log.exception("queue recovery failed")
     await asyncio.sleep(5)

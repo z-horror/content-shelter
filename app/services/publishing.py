@@ -2,7 +2,13 @@ import asyncio
 import logging
 
 from aiogram import Bot
-from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError
+from aiogram.exceptions import (
+    TelegramBadRequest,
+    TelegramForbiddenError,
+    TelegramNetworkError,
+    TelegramRetryAfter,
+    TelegramServerError,
+)
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
 from app import config, db
@@ -10,6 +16,52 @@ from app.services import collections as collections_service
 from app.utils import esc, format_local, now_iso, post_link
 
 log = logging.getLogger(__name__)
+
+AMBIGUOUS_ERRORS = (asyncio.TimeoutError, TimeoutError, TelegramNetworkError, TelegramServerError)
+
+
+class PublishBusy(RuntimeError):
+    """Заявка уже обрабатывается другим обработчиком."""
+
+
+class PublishAmbiguous(RuntimeError):
+    """Неизвестно, создано ли сообщение в Telegram. Автоповтор запрещён."""
+
+
+async def _notify_admins(bot: Bot, text: str):
+    for admin_id in config.ADMIN_USER_IDS:
+        try:
+            await bot.send_message(admin_id, text, parse_mode=None)
+        except Exception:  # noqa: BLE001
+            log.warning("cannot notify admin %s", admin_id)
+
+
+async def _claim(submission_id: int) -> bool:
+    cur = await db.execute(
+        "UPDATE submissions SET publishing_at = ? WHERE id = ? AND publishing_at IS NULL "
+        "AND status IN ('pending', 'scheduled')",
+        (now_iso(), submission_id),
+    )
+    return cur.rowcount == 1
+
+
+async def _release(submission_id: int):
+    await db.execute("UPDATE submissions SET publishing_at = NULL WHERE id = ?", (submission_id,))
+
+
+async def _copy_with_retry(bot: Bot, **kwargs):
+    """TelegramRetryAfter означает, что запрос точно не выполнен: повтор безопасен."""
+    attempts = 0
+    while True:
+        try:
+            return await bot.copy_message(**kwargs)
+        except TelegramRetryAfter as error:
+            attempts += 1
+            if attempts > 2:
+                raise
+            delay = max(1, min(30, int(getattr(error, "retry_after", 1) or 1)))
+            log.warning("telegram rate limit, retrying in %ss", delay)
+            await asyncio.sleep(delay)
 
 
 def post_keyboard(prev_link=None, next_link=None, random_enabled=False) -> InlineKeyboardMarkup:
@@ -157,7 +209,23 @@ async def publish_submission(
         raise RuntimeError("у заявки нет исходного файла, пришли его заново")
     if submission["status"] not in ("pending", "scheduled"):
         raise RuntimeError("заявка уже обработана")
+    if submission["publishing_at"]:
+        raise PublishBusy(f"заявка уже публикуется с {submission['publishing_at']}")
+    if not await _claim(submission_id):
+        raise PublishBusy("не удалось зарезервировать заявку")
 
+    try:
+        return await _publish_claimed(bot, submission, submission_id, caption_text,
+                                      collection_id, season, episode, reviewer_id, notify)
+    except (PublishBusy, PublishAmbiguous):
+        raise
+    except Exception:
+        await _release(submission_id)
+        raise
+
+
+async def _publish_claimed(bot: Bot, submission, submission_id: int, caption_text,
+                           collection_id, season, episode, reviewer_id, notify) -> dict:
     collection = None
     if collection_id:
         collection = await db.fetchone("SELECT * FROM collections WHERE id = ?", (collection_id,))
@@ -188,51 +256,84 @@ async def publish_submission(
         next_link = post_link(following["message_id"]) if following else None
     random_enabled = await db.get_bool_setting("random_button_under_posts")
 
-    message = await bot.copy_message(
-        chat_id=config.CHANNEL_CHAT,
-        from_chat_id=submission["source_chat_id"],
-        message_id=submission["source_message_id"],
-        caption=caption or None,
-        parse_mode="HTML",
-        reply_markup=post_keyboard(prev_link, next_link, random_enabled),
-    )
-
     channel_id = config.CHANNEL_NUMERIC_ID if config.CHANNEL_NUMERIC_ID is not None else config.CHANNEL_CHAT
     try:
-        cur = await db.execute(
-            "INSERT INTO posts (channel_id, message_id, submission_id, collection_id, season, episode, "
-            "media_type, file_id, file_unique_id, caption, author_id, published_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            (
-                channel_id,
-                message.message_id,
-                submission_id,
-                collection_id,
-                season,
-                episode,
-                submission["media_type"],
-                submission["file_id"],
-                submission["file_unique_id"],
-                caption,
-                submission["user_id"],
-                now_iso(),
-            ),
+        message = await _copy_with_retry(
+            bot,
+            chat_id=config.CHANNEL_CHAT,
+            from_chat_id=submission["source_chat_id"],
+            message_id=submission["source_message_id"],
+            caption=caption or None,
+            parse_mode="HTML",
+            reply_markup=post_keyboard(prev_link, next_link, random_enabled),
         )
-    except Exception:
+    except AMBIGUOUS_ERRORS as error:
+        log.critical(
+            "publication result unknown: submission=%s error=%s", submission_id, type(error).__name__
+        )
+        await _notify_admins(
+            bot,
+            f"⚠️ Заявка #{submission_id}: результат публикации неизвестен "
+            f"({type(error).__name__}). Автоповтор остановлен, проверь канал.\n"
+            f"Снять блокировку: UPDATE submissions SET publishing_at=NULL WHERE id={submission_id};",
+        )
+        raise PublishAmbiguous("результат отправки в Telegram неизвестен") from error
+
+    try:
+        async with db.transaction():
+            cur = await db.execute(
+                "INSERT INTO posts (channel_id, message_id, submission_id, collection_id, season, episode, "
+                "media_type, file_id, file_unique_id, caption, author_id, published_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    channel_id,
+                    message.message_id,
+                    submission_id,
+                    collection_id,
+                    season,
+                    episode,
+                    submission["media_type"],
+                    submission["file_id"],
+                    submission["file_unique_id"],
+                    caption,
+                    submission["user_id"],
+                    now_iso(),
+                ),
+            )
+            post_id = cur.lastrowid
+            await db.execute(
+                "UPDATE submissions SET status = 'approved', publishing_at = NULL, "
+                "reviewed_at = ?, reviewer_id = ? WHERE id = ?",
+                (now_iso(), reviewer_id, submission_id),
+            )
+            await db.execute(
+                "UPDATE users SET approved_total = approved_total + 1 WHERE id = ?",
+                (submission["user_id"],),
+            )
+            if collection_id and episode:
+                await collections_service.bump_episode(collection_id, episode)
+    except Exception as error:
+        deleted = False
         try:
             await bot.delete_message(channel_id, message.message_id)
-        except TelegramBadRequest:
-            pass
-        raise RuntimeError("не удалось сохранить пост: возможно, серия уже занята. Попробуй другой номер.")
-    post_id = cur.lastrowid
-
-    await db.execute(
-        "UPDATE submissions SET status = 'approved', reviewed_at = ?, reviewer_id = ? WHERE id = ?",
-        (now_iso(), reviewer_id, submission_id),
-    )
-    await db.execute("UPDATE users SET approved_total = approved_total + 1 WHERE id = ?", (submission["user_id"],))
-    if collection_id and episode:
-        await collections_service.bump_episode(collection_id, episode)
+            deleted = True
+        except Exception:  # noqa: BLE001
+            log.exception("cannot remove orphan channel message %s", message.message_id)
+        if deleted:
+            await _release(submission_id)
+            raise RuntimeError(
+                "не удалось сохранить пост: возможно, серия уже занята. Попробуй другой номер."
+            ) from error
+        log.critical(
+            "publication saved in Telegram but not in DB: submission=%s message=%s",
+            submission_id, message.message_id,
+        )
+        await _notify_admins(
+            bot,
+            f"⚠️ Заявка #{submission_id}: пост создан в канале (message_id={message.message_id}), "
+            f"но запись в БД не сохранена. Автоповтор остановлен.",
+        )
+        raise PublishAmbiguous("пост создан, но запись в БД не сохранена") from error
 
     current = await db.fetchone("SELECT * FROM posts WHERE id = ?", (post_id,))
     await refresh_keyboard(bot, current)
@@ -267,15 +368,16 @@ async def enqueue(bot: Bot, submission_id: int, publish_at: str, caption_text=No
     if submission is None:
         raise RuntimeError("заявка не найдена")
 
-    await db.execute(
-        "INSERT INTO queue (submission_id, collection_id, season, episode, caption, publish_at, created_at) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?)",
-        (submission_id, collection_id, season, episode, caption_text, publish_at, now_iso()),
-    )
-    await db.execute(
-        "UPDATE submissions SET status = 'scheduled', reviewed_at = ?, reviewer_id = ? WHERE id = ?",
-        (now_iso(), reviewer_id, submission_id),
-    )
+    async with db.transaction():
+        await db.execute(
+            "INSERT INTO queue (submission_id, collection_id, season, episode, caption, publish_at, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (submission_id, collection_id, season, episode, caption_text, publish_at, now_iso()),
+        )
+        await db.execute(
+            "UPDATE submissions SET status = 'scheduled', reviewed_at = ?, reviewer_id = ? WHERE id = ?",
+            (now_iso(), reviewer_id, submission_id),
+        )
     await edit_card(bot, submission, f"🕓 Запланировано на {format_local(publish_at)}")
 
     try:
@@ -299,16 +401,17 @@ async def add_existing_post(
     episode=None,
 ) -> int:
     channel_id = config.CHANNEL_NUMERIC_ID if config.CHANNEL_NUMERIC_ID is not None else config.CHANNEL_CHAT
-    cur = await db.execute(
-        "INSERT INTO posts (channel_id, message_id, submission_id, collection_id, season, episode, "
-        "media_type, file_id, file_unique_id, caption, author_id, published_at) "
-        "VALUES (?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, NULL, ?)",
-        (channel_id, channel_message_id, collection_id, season, episode,
-         media_type, file_id, file_unique_id, caption, now_iso()),
-    )
-    post_id = cur.lastrowid
-    if collection_id and episode:
-        await collections_service.bump_episode(collection_id, episode)
+    async with db.transaction():
+        cur = await db.execute(
+            "INSERT INTO posts (channel_id, message_id, submission_id, collection_id, season, episode, "
+            "media_type, file_id, file_unique_id, caption, author_id, published_at) "
+            "VALUES (?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, NULL, ?)",
+            (channel_id, channel_message_id, collection_id, season, episode,
+             media_type, file_id, file_unique_id, caption, now_iso()),
+        )
+        post_id = cur.lastrowid
+        if collection_id and episode:
+            await collections_service.bump_episode(collection_id, episode)
 
     current = await db.fetchone("SELECT * FROM posts WHERE id = ?", (post_id,))
     previous, following = await neighbour_posts(current)

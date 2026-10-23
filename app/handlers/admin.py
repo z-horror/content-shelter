@@ -276,6 +276,16 @@ async def cb_sched_now(callback: CallbackQuery, bot: Bot):
             episode=row["episode"],
             reviewer_id=callback.from_user.id,
         )
+    except (publishing.PublishBusy, publishing.PublishAmbiguous) as error:
+        log.error("manual publish stopped for queue %s: %s", queue_id, type(error).__name__)
+        await db.execute(
+            "UPDATE queue SET status = 'unknown', error = ? WHERE id = ?",
+            (str(error)[:500], queue_id),
+        )
+        await callback.message.answer(
+            "⚠️ Публикация не завершена, результат неизвестен. Автоповтор остановлен, проверь канал."
+        )
+        return
     except Exception as error:  # noqa: BLE001
         log.exception("manual publish from queue failed")
         await db.execute("UPDATE queue SET status = 'waiting' WHERE id = ?", (queue_id,))
@@ -292,16 +302,19 @@ async def cb_sched_cancel(callback: CallbackQuery, bot: Bot):
     if row is None:
         await callback.answer("Запись уже неактуальна", show_alert=True)
         return
-    updated = await db.execute(
-        "UPDATE queue SET status = 'cancelled' WHERE id = ? AND status = 'waiting'", (queue_id,)
-    )
-    if updated.rowcount == 0:
+    async with db.transaction():
+        updated = await db.execute(
+            "UPDATE queue SET status = 'cancelled' WHERE id = ? AND status = 'waiting'", (queue_id,)
+        )
+        cancelled = updated.rowcount == 1
+        if cancelled:
+            await db.execute(
+                "UPDATE submissions SET status = 'pending' WHERE id = ? AND status = 'scheduled'",
+                (row["submission_id"],),
+            )
+    if not cancelled:
         await callback.answer("Запись уже неактуальна", show_alert=True)
         return
-    await db.execute(
-        "UPDATE submissions SET status = 'pending' WHERE id = ? AND status = 'scheduled'",
-        (row["submission_id"],),
-    )
     submission = await db.fetchone("SELECT * FROM submissions WHERE id = ?", (row["submission_id"],))
     if submission is not None:
         await publishing.edit_card(
@@ -884,12 +897,13 @@ async def cb_post_delete_ok(callback: CallbackQuery, bot: Bot):
         await bot.delete_message(post["channel_id"], post["message_id"])
     except TelegramBadRequest:
         pass
-    await db.execute("DELETE FROM posts WHERE id = ?", (post["id"],))
-    if post["submission_id"]:
-        await db.execute(
-            "UPDATE submissions SET status = 'deleted' WHERE id = ? AND status = 'approved'",
-            (post["submission_id"],),
-        )
+    async with db.transaction():
+        await db.execute("DELETE FROM posts WHERE id = ?", (post["id"],))
+        if post["submission_id"]:
+            await db.execute(
+                "UPDATE submissions SET status = 'deleted' WHERE id = ? AND status = 'approved'",
+                (post["submission_id"],),
+            )
     await publishing.refresh_keyboard(bot, previous)
     await publishing.refresh_keyboard(bot, following)
     await callback.answer("Удалено")

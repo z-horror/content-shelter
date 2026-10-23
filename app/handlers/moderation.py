@@ -515,17 +515,19 @@ async def on_ban_reason(message: Message, bot: Bot):
         await message.answer("Не понял, кого блокировать.")
         return
 
-    await db.execute(
-        "UPDATE users SET is_banned = 1, ban_reason = ?, banned_at = ? WHERE id = ?",
-        (reason, now_iso(), target_user),
-    )
-    submission = await db.fetchone("SELECT * FROM submissions WHERE id = ?", (submission_id,))
-    if submission is not None and submission["status"] == "pending":
+    async with db.transaction():
         await db.execute(
-            "UPDATE submissions SET status = 'rejected', reject_reason = ?, reviewed_at = ?, reviewer_id = ? "
-            "WHERE id = ?",
-            ("автор заблокирован", now_iso(), admin_id, submission_id),
+            "UPDATE users SET is_banned = 1, ban_reason = ?, banned_at = ? WHERE id = ?",
+            (reason, now_iso(), target_user),
         )
+        submission = await db.fetchone("SELECT * FROM submissions WHERE id = ?", (submission_id,))
+        if submission is not None and submission["status"] == "pending":
+            await db.execute(
+                "UPDATE submissions SET status = 'rejected', reject_reason = ?, reviewed_at = ?, reviewer_id = ? "
+                "WHERE id = ?",
+                ("автор заблокирован", now_iso(), admin_id, submission_id),
+            )
+    if submission is not None and submission["status"] == "pending":
         await publishing.edit_card(bot, submission, "🚫 Автор заблокирован")
     try:
         notice = "🚫 Ты больше не можешь отправлять заявки."
