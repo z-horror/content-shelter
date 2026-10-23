@@ -103,10 +103,21 @@ $EDITOR .env
 0 4 * * * /path/to/neuroslop-bot/deploy/backup.sh >> /var/log/neuroslop-backup.log 2>&1
 ```
 
-## Логи
+## Логи и диагностика
 
 ```bash
 docker compose logs -f --tail=100
+```
+
+Аварийные операции (зависшие публикации, восстановление) описаны в
+`docs/operations.md`.
+
+## Тесты
+
+```bash
+docker build -t neuroslop-test .
+docker run --rm -v "$PWD:/src" -w /src neuroslop-test \
+  sh -c "pip install -q -r requirements-dev.txt && python -m pytest -q"
 ```
 
 ## Как пользоваться
@@ -142,6 +153,8 @@ docker compose logs -f --tail=100
 
 - `CHANGELOG.md` — что уже сделано.
 - `docs/backlog.md` — баги и идеи со статусами.
+- `docs/operations.md` — обновление, бэкапы, восстановление, диагностика
+  незавершённых публикаций.
 
 ## Структура
 

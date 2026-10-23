@@ -45,6 +45,7 @@ EOF
     echo ".env создан"
 else
     echo ".env найден, используем его"
+    chmod 600 .env
 fi
 
 mkdir -p data

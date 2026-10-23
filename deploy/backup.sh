@@ -23,11 +23,23 @@ source = sqlite3.connect(sys.argv[1])
 target = sqlite3.connect(sys.argv[2])
 with target:
     source.backup(target)
+
+check = target.execute("PRAGMA integrity_check").fetchone()[0]
+required = {"settings", "users", "collections", "submissions", "posts", "queue", "admin_sessions"}
+tables = {row[0] for row in target.execute("SELECT name FROM sqlite_master WHERE type = 'table'")}
+missing = required - tables
+
 target.close()
 source.close()
+
+if check != "ok":
+    raise SystemExit(f"backup verification failed: integrity_check={check}")
+if missing:
+    raise SystemExit(f"backup verification failed: missing tables {sorted(missing)}")
 PY
 
 tar -czf "$OUT" -C "$TMP" .
+chmod 600 "$OUT"
 find "$ROOT/backups" -name 'neuroslop-*.tar.gz' -mtime +14 -delete
 
 echo "backup: $OUT"
