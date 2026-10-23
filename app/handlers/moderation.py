@@ -8,7 +8,8 @@ from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMar
 from app import config, db, sessions
 from app.services import collections as collections_service
 from app.services import publishing
-from app.utils import esc, format_local, now_iso, parse_user_datetime
+from app.keyboards import schedule_keyboard
+from app.utils import esc, format_local, now_iso, parse_user_datetime, preset_datetime
 
 log = logging.getLogger(__name__)
 
@@ -355,18 +356,76 @@ async def when_now(callback: CallbackQuery, bot: Bot):
 async def when_later(callback: CallbackQuery, bot: Bot):
     if await _deny(callback):
         return
-    if not await sessions.get_session(callback.from_user.id):
+    session = await sessions.get_session(callback.from_user.id)
+    if not session or session.get("step") != "when":
         await callback.answer("Сессия устарела, начни заново", show_alert=True)
         return
-    await sessions.update_session(callback.from_user.id, step="time")
     await callback.answer()
-    await _dm(
-        bot,
-        callback.from_user.id,
-        "Когда публиковать? Форматы: `ЧЧ:ММ`, `ДД.ММ ЧЧ:ММ`, `ГГГГ-ММ-ДД ЧЧ:ММ`, `+30m`, `+2h`.\n"
-        f"Таймзона: {config.TIMEZONE}.",
-        cancel_kb,
-    )
+    await _dm(bot, callback.from_user.id, "Когда публиковать?", schedule_keyboard())
+
+
+@router.callback_query(F.data.startswith("sched:"))
+async def schedule_preset(callback: CallbackQuery, bot: Bot):
+    if await _deny(callback):
+        return
+    admin_id = callback.from_user.id
+    session = await sessions.get_session(admin_id)
+    if not session or session.get("step") not in ("when", "sched_when"):
+        await callback.answer("Сессия устарела, начни заново", show_alert=True)
+        return
+
+    value = callback.data.split(":", 1)[1]
+    if value == "manual":
+        step = "time" if session.get("step") == "when" else "sched_time"
+        await sessions.update_session(admin_id, step=step)
+        await callback.answer()
+        await _dm(
+            bot,
+            admin_id,
+            "Пришли время: `через 2 часа`, `завтра 10:00`, `сегодня в 19`, "
+            "`25.10 18:00`, `+30m`.\n"
+            f"Таймзона: {config.TIMEZONE}.",
+            cancel_kb,
+        )
+        return
+
+    publish_at = preset_datetime(value)
+    if not publish_at:
+        await callback.answer("Не понял время", show_alert=True)
+        return
+
+    if session.get("step") == "when":
+        await sessions.clear_session(admin_id)
+        try:
+            await publishing.enqueue(
+                bot,
+                submission_id=int(session["submission_id"]),
+                publish_at=publish_at,
+                caption_text=session.get("caption"),
+                collection_id=session.get("collection_id"),
+                season=session.get("season"),
+                episode=session.get("episode"),
+                reviewer_id=admin_id,
+            )
+        except Exception as error:  # noqa: BLE001
+            log.exception("enqueue failed")
+            await callback.answer("Ошибка", show_alert=True)
+            await _dm(bot, admin_id, f"⚠️ Не удалось запланировать: {esc(error)}")
+            return
+        await callback.answer("Запланировано")
+        await _dm(bot, admin_id, f"🕓 Запланировано на {format_local(publish_at)}.")
+        return
+
+    queue_id = int(session["queue_id"])
+    row = await db.fetchone("SELECT * FROM queue WHERE id = ? AND status = 'waiting'", (queue_id,))
+    if row is None:
+        await sessions.clear_session(admin_id)
+        await callback.answer("Запись уже неактуальна", show_alert=True)
+        return
+    await db.execute("UPDATE queue SET publish_at = ? WHERE id = ?", (publish_at, queue_id))
+    await sessions.clear_session(admin_id)
+    await callback.answer("Время изменено")
+    await _dm(bot, admin_id, f"🕓 Новое время: {format_local(publish_at)}.")
 
 
 @router.message(SessionStep("time"))
@@ -396,6 +455,29 @@ async def on_time(message: Message, bot: Bot):
         await message.answer(f"⚠️ Не удалось запланировать: {esc(error)}")
         return
     await message.answer(f"🕓 Запланировано на {format_local(publish_at)}.")
+
+
+@router.message(SessionStep("sched_time"))
+async def on_reschedule_time(message: Message, bot: Bot):
+    publish_at = parse_user_datetime(message.text or "")
+    if publish_at is None:
+        await message.answer(
+            "Не понял время. Примеры: `через 2 часа`, `завтра 10:00`, `25.10 18:00`, `+30m`.",
+            parse_mode="Markdown",
+        )
+        return
+    session = await sessions.get_session(message.from_user.id)
+    if not session:
+        return
+    admin_id = message.from_user.id
+    queue_id = int(session["queue_id"])
+    await sessions.clear_session(admin_id)
+    row = await db.fetchone("SELECT * FROM queue WHERE id = ? AND status = 'waiting'", (queue_id,))
+    if row is None:
+        await message.answer("Запись уже неактуальна.")
+        return
+    await db.execute("UPDATE queue SET publish_at = ? WHERE id = ?", (publish_at, queue_id))
+    await message.answer(f"🕓 Новое время: {format_local(publish_at)}.")
 
 
 @router.message(SessionStep("reject"))

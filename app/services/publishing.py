@@ -107,12 +107,17 @@ async def refresh_keyboard(bot: Bot, post_row):
         log.warning("cannot refresh keyboard for post %s: %s", post_row["message_id"], error)
 
 
-async def edit_card(bot: Bot, submission, status_line: str, remove_buttons=True):
+async def edit_card(bot: Bot, submission, status_line: str, remove_buttons=True, keyboard=None):
     if not submission["admin_chat_id"] or not submission["admin_message_id"]:
         return
     base = submission["card_caption"] or f"📥 <b>Заявка #{submission['id']}</b>"
     caption = f"{base}\n\n{status_line}"
-    markup = InlineKeyboardMarkup(inline_keyboard=[]) if remove_buttons else None
+    if keyboard is not None:
+        markup = keyboard
+    elif remove_buttons:
+        markup = InlineKeyboardMarkup(inline_keyboard=[])
+    else:
+        markup = None
     try:
         await bot.edit_message_caption(
             chat_id=submission["admin_chat_id"],

@@ -7,10 +7,11 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
 
-from app import config, db
+from app import config, db, sessions
 from app.services import collections as collections_service
 from app.services import publishing
-from app.utils import esc
+from app.keyboards import schedule_keyboard
+from app.utils import esc, format_local
 
 log = logging.getLogger(__name__)
 
@@ -55,6 +56,7 @@ def _btn(text, data=None, url=None):
 def menu_keyboard():
     return InlineKeyboardMarkup(inline_keyboard=[
         [_btn("📥 Очередь", "adm:queue")],
+        [_btn("🗓 Запланировано", "adm:sched")],
         [_btn("📊 Статистика", "adm:stats")],
         [_btn("📁 Подборки", "adm:cols")],
         [_btn("⚙️ Настройки", "adm:set")],
@@ -164,6 +166,162 @@ async def cmd_queue(message: Message):
     await message.answer(
         f"📥 Неразобранные заявки: {len(rows)}",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard),
+    )
+
+
+async def _send_scheduled(target):
+    rows = await db.fetchall(
+        "SELECT q.*, u.username, u.first_name, c.name AS collection_name "
+        "FROM queue q "
+        "JOIN submissions s ON s.id = q.submission_id "
+        "LEFT JOIN users u ON u.id = s.user_id "
+        "LEFT JOIN collections c ON c.id = q.collection_id "
+        "WHERE q.status = 'waiting' ORDER BY q.publish_at"
+    )
+    if not rows:
+        await target.answer("🗓 Ничего не запланировано.")
+        return
+    keyboard = []
+    for row in rows:
+        title = f"{format_local(row['publish_at'])} · #{row['submission_id']}"
+        if row["collection_name"]:
+            title += f" · {row['collection_name']}"
+            if row["episode"]:
+                title += f" S{int(row['season'] or 1)}E{int(row['episode'])}"
+        if len(title) > 60:
+            title = title[:57] + "..."
+        keyboard.append([_btn(f"🕓 {title}", f"sch:v:{row['id']}")])
+    keyboard.append([_btn("⚙️ Админка", "adm:menu")])
+    await target.answer(
+        f"🗓 Запланировано: {len(rows)}",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard),
+    )
+
+
+@router.callback_query(F.data == "adm:sched", IsAdmin())
+async def cb_scheduled(callback: CallbackQuery):
+    await callback.answer()
+    await _send_scheduled(callback.message)
+
+
+@router.message(Command("scheduled"), IsAdmin())
+async def cmd_scheduled(message: Message):
+    await _send_scheduled(message)
+
+
+@router.callback_query(F.data.startswith("sch:v:"), IsAdmin())
+async def cb_sched_view(callback: CallbackQuery):
+    queue_id = int(callback.data.split(":")[2])
+    row = await db.fetchone(
+        "SELECT q.*, u.username, u.first_name, c.name AS collection_name "
+        "FROM queue q "
+        "JOIN submissions s ON s.id = q.submission_id "
+        "LEFT JOIN users u ON u.id = s.user_id "
+        "LEFT JOIN collections c ON c.id = q.collection_id "
+        "WHERE q.id = ?",
+        (queue_id,),
+    )
+    if row is None or row["status"] != "waiting":
+        await callback.answer("Запись уже неактуальна", show_alert=True)
+        return
+    await callback.answer()
+    author = f"@{row['username']}" if row["username"] else (row["first_name"] or "—")
+    lines = [
+        f"🕓 Заявка #{row['submission_id']}",
+        f"Время: {format_local(row['publish_at'])}",
+        f"Автор: {author}",
+    ]
+    if row["collection_name"]:
+        lines.append(f"Подборка: {row['collection_name']}")
+        if row["episode"]:
+            lines.append(f"Серия: S{int(row['season'] or 1)}E{int(row['episode'])}")
+    await callback.message.answer(
+        "\n".join(lines),
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [_btn("🚀 Опубликовать сейчас", f"sch:now:{queue_id}")],
+            [_btn("✏️ Изменить время", f"sch:time:{queue_id}")],
+            [_btn("🗑 Отменить", f"sch:cancel:{queue_id}")],
+            [_btn("⬅️ К списку", "adm:sched")],
+        ]),
+    )
+
+
+@router.callback_query(F.data.startswith("sch:now:"), IsAdmin())
+async def cb_sched_now(callback: CallbackQuery, bot: Bot):
+    queue_id = int(callback.data.split(":")[2])
+    row = await db.fetchone("SELECT * FROM queue WHERE id = ? AND status = 'waiting'", (queue_id,))
+    if row is None:
+        await callback.answer("Запись уже неактуальна", show_alert=True)
+        return
+    moved = await db.execute(
+        "UPDATE queue SET status = 'processing' WHERE id = ? AND status = 'waiting'", (queue_id,)
+    )
+    if moved.rowcount == 0:
+        await callback.answer("Запись уже неактуальна", show_alert=True)
+        return
+    await callback.answer("Публикую...")
+    try:
+        result = await publishing.publish_submission(
+            bot,
+            submission_id=row["submission_id"],
+            caption_text=row["caption"],
+            collection_id=row["collection_id"],
+            season=row["season"],
+            episode=row["episode"],
+            reviewer_id=callback.from_user.id,
+        )
+    except Exception as error:  # noqa: BLE001
+        log.exception("manual publish from queue failed")
+        await db.execute("UPDATE queue SET status = 'waiting' WHERE id = ?", (queue_id,))
+        await callback.message.answer(f"⚠️ Не удалось опубликовать: {esc(error)}")
+        return
+    await db.execute("UPDATE queue SET status = 'done' WHERE id = ?", (queue_id,))
+    await callback.message.answer(f"✅ Опубликовано: {result['link']}")
+
+
+@router.callback_query(F.data.startswith("sch:cancel:"), IsAdmin())
+async def cb_sched_cancel(callback: CallbackQuery, bot: Bot):
+    queue_id = int(callback.data.split(":")[2])
+    row = await db.fetchone("SELECT * FROM queue WHERE id = ? AND status = 'waiting'", (queue_id,))
+    if row is None:
+        await callback.answer("Запись уже неактуальна", show_alert=True)
+        return
+    updated = await db.execute(
+        "UPDATE queue SET status = 'cancelled' WHERE id = ? AND status = 'waiting'", (queue_id,)
+    )
+    if updated.rowcount == 0:
+        await callback.answer("Запись уже неактуальна", show_alert=True)
+        return
+    await db.execute(
+        "UPDATE submissions SET status = 'pending' WHERE id = ? AND status = 'scheduled'",
+        (row["submission_id"],),
+    )
+    submission = await db.fetchone("SELECT * FROM submissions WHERE id = ?", (row["submission_id"],))
+    if submission is not None:
+        await publishing.edit_card(
+            bot,
+            submission,
+            "⏳ Возвращено в очередь",
+            keyboard=publishing.card_keyboard(row["submission_id"]),
+        )
+    await callback.answer("Отменено")
+    await callback.message.answer(
+        f"Заявка #{row['submission_id']} снята с публикации и вернулась в очередь."
+    )
+
+
+@router.callback_query(F.data.startswith("sch:time:"), IsAdmin())
+async def cb_sched_time(callback: CallbackQuery):
+    queue_id = int(callback.data.split(":")[2])
+    row = await db.fetchone("SELECT * FROM queue WHERE id = ? AND status = 'waiting'", (queue_id,))
+    if row is None:
+        await callback.answer("Запись уже неактуальна", show_alert=True)
+        return
+    await sessions.set_session(callback.from_user.id, step="sched_when", queue_id=queue_id)
+    await callback.answer()
+    await callback.message.answer(
+        "Когда публиковать?",
+        reply_markup=schedule_keyboard(),
     )
 
 

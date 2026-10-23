@@ -63,6 +63,31 @@ def format_local(iso_value) -> str:
     return local.strftime("%d.%m.%Y %H:%M")
 
 
+def _to_utc(dt: datetime) -> str:
+    return dt.astimezone(timezone.utc).replace(tzinfo=None).isoformat(sep=" ", timespec="seconds")
+
+
+def preset_datetime(value: str):
+    """value: m:<минуты> | today19 | tomorrow10"""
+    tz = ZoneInfo(config.TIMEZONE)
+    now = datetime.now(tz)
+    if value.startswith("m:"):
+        try:
+            minutes = int(value[2:])
+        except ValueError:
+            return None
+        return _to_utc(now + timedelta(minutes=minutes))
+    if value == "today19":
+        target = now.replace(hour=19, minute=0, second=0, microsecond=0)
+        if target <= now:
+            target += timedelta(days=1)
+        return _to_utc(target)
+    if value == "tomorrow10":
+        target = (now + timedelta(days=1)).replace(hour=10, minute=0, second=0, microsecond=0)
+        return _to_utc(target)
+    return None
+
+
 def parse_user_datetime(text: str):
     """Возвращает UTC-строку или None.
 
@@ -85,6 +110,31 @@ def parse_user_datetime(text: str):
         }[unit]
         target = now + delta
         return target.astimezone(timezone.utc).replace(tzinfo=None).isoformat(sep=" ", timespec="seconds")
+
+    match = re.fullmatch(r"через\s+(\d+)\s*(минут\w*|мин|час\w*|день|дня|дней)", raw)
+    if match:
+        amount = int(match.group(1))
+        unit = match.group(2)
+        if unit.startswith("мин"):
+            delta = timedelta(minutes=amount)
+        elif unit.startswith("час"):
+            delta = timedelta(hours=amount)
+        else:
+            delta = timedelta(days=amount)
+        return _to_utc(now + delta)
+
+    match = re.fullmatch(r"(завтра|сегодня)(?:\s+в)?\s+(\d{1,2})(?::(\d{2}))?", raw)
+    if match:
+        day, hour = match.group(1), int(match.group(2))
+        minute = int(match.group(3) or 0)
+        if hour > 23 or minute > 59:
+            return None
+        target = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+        if day == "завтра":
+            target += timedelta(days=1)
+        elif target <= now:
+            target += timedelta(days=1)
+        return _to_utc(target)
 
     formats = ["%Y-%m-%d %H:%M", "%d.%m.%Y %H:%M", "%d.%m %H:%M", "%H:%M"]
     for fmt in formats:
