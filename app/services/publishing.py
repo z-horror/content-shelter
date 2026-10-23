@@ -284,3 +284,33 @@ async def enqueue(bot: Bot, submission_id: int, publish_at: str, caption_text=No
         )
     except (TelegramForbiddenError, TelegramBadRequest):
         pass
+
+
+async def add_existing_post(
+    bot: Bot,
+    channel_message_id: int,
+    media_type: str,
+    file_id,
+    file_unique_id,
+    caption,
+    collection_id=None,
+    season=None,
+    episode=None,
+) -> int:
+    channel_id = config.CHANNEL_NUMERIC_ID if config.CHANNEL_NUMERIC_ID is not None else config.CHANNEL_CHAT
+    cur = await db.execute(
+        "INSERT INTO posts (channel_id, message_id, submission_id, collection_id, season, episode, "
+        "media_type, file_id, file_unique_id, caption, author_id, published_at) "
+        "VALUES (?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, NULL, ?)",
+        (channel_id, channel_message_id, collection_id, season, episode,
+         media_type, file_id, file_unique_id, caption, now_iso()),
+    )
+    post_id = cur.lastrowid
+    if collection_id and episode:
+        await collections_service.bump_episode(collection_id, episode)
+
+    current = await db.fetchone("SELECT * FROM posts WHERE id = ?", (post_id,))
+    previous, following = await neighbour_posts(current)
+    await refresh_keyboard(bot, previous)
+    await refresh_keyboard(bot, following)
+    return post_id

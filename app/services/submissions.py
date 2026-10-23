@@ -37,3 +37,18 @@ def duplicate_lines(found):
     if pending:
         lines.append(f"⚠️ Такая же заявка уже на модерации: #{pending['id']}")
     return lines
+
+
+def forwarded_from_channel(message):
+    """(chat_id, message_id) если сообщение — форвард из канала, иначе (None, None)."""
+    origin = getattr(message, "forward_origin", None)
+    if origin is not None:
+        chat = getattr(origin, "chat", None)
+        message_id = getattr(origin, "message_id", None)
+        if chat is not None and message_id:
+            return chat.id, message_id
+    chat = getattr(message, "forward_from_chat", None)
+    message_id = getattr(message, "forward_from_message_id", None)
+    if chat is not None and message_id:
+        return chat.id, message_id
+    return None, None

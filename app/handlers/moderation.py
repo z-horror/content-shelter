@@ -10,7 +10,7 @@ from app.services import collections as collections_service
 from app.services import publishing
 from app.services import submissions as submissions_service
 from app.keyboards import schedule_keyboard
-from app.utils import esc, format_local, now_iso, parse_user_datetime, preset_datetime
+from app.utils import esc, format_local, now_iso, parse_user_datetime, post_link, preset_datetime
 
 log = logging.getLogger(__name__)
 
@@ -588,9 +588,282 @@ async def _notify_author(bot: Bot, submission_id: int, text: str):
         pass
 
 
+class ForwardFromChannel(BaseFilter):
+    async def __call__(self, message: Message) -> bool:
+        if message.from_user is None or not is_admin(message.from_user.id):
+            return False
+        if message.media_group_id:
+            return False
+        chat_id, message_id = submissions_service.forwarded_from_channel(message)
+        if not message_id:
+            return False
+        return chat_id in (config.CHANNEL_NUMERIC_ID, config.CHANNEL_CHAT)
+
+
+@router.message(ForwardFromChannel())
+async def forwarded_post(message: Message, bot: Bot):
+    from app.handlers.user import extract_media
+
+    media = extract_media(message)
+    if media is None:
+        await message.answer("Поддерживаются только видео и фото.")
+        return
+
+    chat_id, original_id = submissions_service.forwarded_from_channel(message)
+    existing = await db.fetchone(
+        "SELECT p.*, c.name AS collection_name FROM posts p "
+        "LEFT JOIN collections c ON c.id = p.collection_id "
+        "WHERE p.channel_id = ? AND p.message_id = ?",
+        (chat_id, original_id),
+    )
+    if existing is not None:
+        where = f" в подборке «{existing['collection_name']}»" if existing["collection_name"] else ""
+        await message.answer(f"Этот пост уже в базе{where}.")
+        return
+
+    caption = (message.caption or "").strip()[:1000] or None
+    card = (
+        f"📄 <b>Старый пост из канала</b>\n"
+        f"ID сообщения: <code>{original_id}</code> · "
+        f"{'видео' if media['type'] == 'video' else 'фото'}\n"
+    )
+    if caption:
+        card += f"💬 {esc(caption)}\n"
+    file_dup = await db.fetchone(
+        "SELECT p.*, c.name AS collection_name FROM posts p "
+        "LEFT JOIN collections c ON c.id = p.collection_id "
+        "WHERE p.file_unique_id = ? AND p.is_deleted = 0 LIMIT 1",
+        (media.get("unique_id"),),
+    )
+    if file_dup is not None:
+        where = f"«{file_dup['collection_name']}»" if file_dup["collection_name"] else "без подборки"
+        card += f"⚠️ Такой файл уже есть: {where}\n"
+    card += "\n⚠️ Пост опубликован не ботом: тег, номер серии и кнопки к нему добавить нельзя."
+
+    await sessions.set_session(
+        message.from_user.id,
+        step="fwd_card",
+        channel_chat_id=chat_id,
+        channel_message_id=original_id,
+        media_type=media["type"],
+        file_id=media.get("file_id"),
+        file_unique_id=media.get("unique_id"),
+        caption=caption,
+    )
+    await message.answer(
+        card,
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [_btn("📁 Добавить в подборку", "fwd:add"), _btn("❌ Пропустить", "fwd:skip")],
+        ]),
+    )
+
+
+@router.callback_query(F.data == "fwd:skip")
+async def fwd_skip(callback: CallbackQuery):
+    if await _deny(callback):
+        return
+    await sessions.clear_session(callback.from_user.id)
+    await callback.answer("Пропущено")
+    await callback.message.answer("Ок, пропустил.")
+
+
+@router.callback_query(F.data == "fwd:add")
+async def fwd_add(callback: CallbackQuery, bot: Bot):
+    if await _deny(callback):
+        return
+    session = await sessions.get_session(callback.from_user.id)
+    if not session or session.get("step") != "fwd_card":
+        await callback.answer("Сессия устарела, перешли пост заново", show_alert=True)
+        return
+    await sessions.update_session(callback.from_user.id, step="fwd_pick")
+    rows = await db.fetchall("SELECT * FROM collections ORDER BY position, id")
+    keyboard = []
+    for row in rows:
+        mark = "📺" if row["is_ordered"] else "📁"
+        keyboard.append([_btn(f"{mark} {row['name']}", f"fwd:c:{row['id']}")])
+    keyboard.append([_btn("➕ Новая подборка", "fwd:new")])
+    keyboard.append([_btn("✖️ Отмена", "flow:cancel")])
+    await callback.answer()
+    await _dm(bot, callback.from_user.id, "В какую подборку добавить старый пост?",
+              InlineKeyboardMarkup(inline_keyboard=keyboard))
+
+
+@router.callback_query(F.data.startswith("fwd:c:"))
+async def fwd_choose_collection(callback: CallbackQuery, bot: Bot):
+    if await _deny(callback):
+        return
+    collection_id = int(callback.data.split(":")[2])
+    collection = await db.fetchone("SELECT * FROM collections WHERE id = ?", (collection_id,))
+    session = await sessions.get_session(callback.from_user.id)
+    if collection is None or not session or session.get("step") != "fwd_pick":
+        await callback.answer("Сессия устарела, перешли пост заново", show_alert=True)
+        return
+    await callback.answer()
+
+    if collection["is_ordered"]:
+        season = int(collection["season"])
+        episode = await collections_service.next_episode(collection_id, season)
+        await sessions.update_session(
+            callback.from_user.id, step="fwd_ep_confirm",
+            collection_id=collection_id, season=season, episode=episode,
+        )
+        await _dm(bot, callback.from_user.id,
+                  f"Подборка «{collection['name']}». Серия S{season}E{episode}?",
+                  InlineKeyboardMarkup(inline_keyboard=[
+                      [_btn("✅ Ок", "fwd:ep:ok"), _btn("✏️ Изменить номер", "fwd:ep:edit")],
+                      [_btn("✖️ Отмена", "flow:cancel")],
+                  ]))
+        return
+
+    await sessions.update_session(
+        callback.from_user.id, step="fwd_finish",
+        collection_id=collection_id, season=None, episode=None,
+    )
+    await _fwd_finalize(bot, callback.from_user.id)
+
+
+@router.callback_query(F.data == "fwd:new")
+async def fwd_new_collection(callback: CallbackQuery, bot: Bot):
+    if await _deny(callback):
+        return
+    session = await sessions.get_session(callback.from_user.id)
+    if not session or session.get("step") != "fwd_pick":
+        await callback.answer("Сессия устарела", show_alert=True)
+        return
+    await sessions.update_session(callback.from_user.id, step="fwd_newcol_name")
+    await callback.answer()
+    await _dm(bot, callback.from_user.id, "Название новой подборки:", cancel_kb)
+
+
+@router.message(SessionStep("fwd_newcol_name"))
+async def fwd_newcol_name(message: Message):
+    name = (message.text or "").strip()
+    if name.startswith("/") or len(name) < 2:
+        await message.answer("Пришли название подборки текстом.")
+        return
+    await sessions.update_session(message.from_user.id, step="fwd_newcol_type", new_name=name[:80])
+    await message.answer(
+        "Тип подборки?",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [_btn("📺 Сериал (с номерами серий)", "fwd:nt:1")],
+            [_btn("📁 Папка (без номеров)", "fwd:nt:0")],
+            [_btn("✖️ Отмена", "flow:cancel")],
+        ]),
+    )
+
+
+@router.callback_query(F.data.startswith("fwd:nt:"))
+async def fwd_newcol_type(callback: CallbackQuery, bot: Bot):
+    if await _deny(callback):
+        return
+    session = await sessions.get_session(callback.from_user.id)
+    if not session or session.get("step") != "fwd_newcol_type":
+        await callback.answer("Сессия устарела", show_alert=True)
+        return
+    is_ordered = callback.data.endswith(":1")
+    name = session.get("new_name") or "Без названия"
+    collection_id = await collections_service.create_collection(name, is_ordered)
+    await callback.answer()
+    if is_ordered:
+        season = 1
+        episode = await collections_service.next_episode(collection_id, season)
+        await sessions.update_session(callback.from_user.id, step="fwd_ep_confirm",
+                                      collection_id=collection_id, season=season, episode=episode)
+        await _dm(bot, callback.from_user.id, f"Подборка создана. Серия S{season}E{episode}?",
+                  InlineKeyboardMarkup(inline_keyboard=[
+                      [_btn("✅ Ок", "fwd:ep:ok"), _btn("✏️ Изменить номер", "fwd:ep:edit")],
+                      [_btn("✖️ Отмена", "flow:cancel")],
+                  ]))
+        return
+    await sessions.update_session(callback.from_user.id, step="fwd_finish",
+                                  collection_id=collection_id, season=None, episode=None)
+    await _fwd_finalize(bot, callback.from_user.id)
+
+
+@router.callback_query(F.data == "fwd:ep:ok")
+async def fwd_episode_ok(callback: CallbackQuery, bot: Bot):
+    if await _deny(callback):
+        return
+    session = await sessions.get_session(callback.from_user.id)
+    if not session or session.get("step") != "fwd_ep_confirm":
+        await callback.answer("Сессия устарела", show_alert=True)
+        return
+    await callback.answer()
+    await sessions.update_session(callback.from_user.id, step="fwd_finish")
+    await _fwd_finalize(bot, callback.from_user.id)
+
+
+@router.callback_query(F.data == "fwd:ep:edit")
+async def fwd_episode_edit(callback: CallbackQuery, bot: Bot):
+    if await _deny(callback):
+        return
+    session = await sessions.get_session(callback.from_user.id)
+    if not session or session.get("step") != "fwd_ep_confirm":
+        await callback.answer("Сессия устарела", show_alert=True)
+        return
+    await sessions.update_session(callback.from_user.id, step="fwd_episode")
+    await callback.answer()
+    await _dm(bot, callback.from_user.id, "Введи номер серии числом:", cancel_kb)
+
+
+@router.message(SessionStep("fwd_episode"))
+async def fwd_episode_number(message: Message, bot: Bot):
+    try:
+        episode = int((message.text or "").strip())
+        if episode < 1:
+            raise ValueError
+    except ValueError:
+        await message.answer("Нужно положительное число. Попробуй ещё раз.")
+        return
+    await sessions.update_session(message.from_user.id, episode=episode, step="fwd_finish")
+    await _fwd_finalize(bot, message.from_user.id)
+
+
+async def _fwd_finalize(bot: Bot, admin_id: int):
+    session = await sessions.get_session(admin_id)
+    if not session or session.get("step") != "fwd_finish":
+        return
+    await sessions.clear_session(admin_id)
+    collection = await db.fetchone("SELECT * FROM collections WHERE id = ?", (session.get("collection_id"),))
+    if collection is None:
+        await _dm(bot, admin_id, "Подборка не найдена.")
+        return
+    try:
+        await publishing.add_existing_post(
+            bot,
+            channel_message_id=int(session["channel_message_id"]),
+            media_type=session["media_type"],
+            file_id=session.get("file_id"),
+            file_unique_id=session.get("file_unique_id"),
+            caption=session.get("caption"),
+            collection_id=collection["id"],
+            season=session.get("season"),
+            episode=session.get("episode"),
+        )
+    except Exception as error:  # noqa: BLE001
+        log.exception("cannot add existing post")
+        await _dm(bot, admin_id, f"⚠️ Не удалось добавить: {esc(error)}")
+        return
+    season = session.get("season")
+    episode = session.get("episode")
+    where = f"«{esc(collection['name'])}»"
+    if episode:
+        where += f" · S{int(season or collection['season'])}E{int(episode)}"
+    link = post_link(int(session["channel_message_id"]))
+    text = f"✅ Добавлено в {where}"
+    if link:
+        text += f"\n{link}"
+    await _dm(bot, admin_id, text)
+
+
 @router.message(F.chat.id == config.ADMIN_CHAT, F.video | F.photo | F.document)
 async def admin_direct_upload(message: Message, bot: Bot):
     if message.from_user is None or not is_admin(message.from_user.id):
+        return
+    origin_chat, _ = submissions_service.forwarded_from_channel(message)
+    if origin_chat is not None and origin_chat in (config.CHANNEL_NUMERIC_ID, config.CHANNEL_CHAT):
+        if message.media_group_id:
+            await message.answer("Альбомы не поддерживаются, перешли по одному.")
         return
     if message.media_group_id:
         await message.answer("По одному файлу за раз, без альбомов.")

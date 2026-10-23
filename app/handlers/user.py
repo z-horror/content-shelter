@@ -166,6 +166,11 @@ async def submit_media(message: Message, state: FSMContext, bot: Bot):
         await message.answer(text, parse_mode=None)
         return
 
+    origin_chat, _ = submissions_service.forwarded_from_channel(message)
+    if origin_chat is not None and origin_chat in (config.CHANNEL_NUMERIC_ID, config.CHANNEL_CHAT):
+        await message.answer("Этот пост уже в канале — добавлять не нужно.")
+        return
+
     if message.media_group_id:
         await message.answer("Пришли, пожалуйста, один файл за раз (без альбомов).")
         return
