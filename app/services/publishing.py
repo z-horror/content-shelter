@@ -5,6 +5,7 @@ from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
 from app import config, db
+from app.services import collections as collections_service
 from app.utils import esc, format_local, now_iso, post_link
 
 log = logging.getLogger(__name__)
@@ -30,16 +31,17 @@ def post_keyboard(prev_link=None, next_link=None, random_enabled=False) -> Inlin
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
-def card_keyboard(submission_id: int) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [
-                InlineKeyboardButton(text="✅ Опубликовать", callback_data=f"mod:pub:{submission_id}"),
-                InlineKeyboardButton(text="📁 В подборку", callback_data=f"mod:col:{submission_id}"),
-            ],
-            [InlineKeyboardButton(text="❌ Отклонить", callback_data=f"mod:rej:{submission_id}")],
-        ]
-    )
+def card_keyboard(submission_id: int, author_id=None) -> InlineKeyboardMarkup:
+    rows = [
+        [
+            InlineKeyboardButton(text="✅ Опубликовать", callback_data=f"mod:pub:{submission_id}"),
+            InlineKeyboardButton(text="📁 В подборку", callback_data=f"mod:col:{submission_id}"),
+        ],
+        [InlineKeyboardButton(text="❌ Отклонить", callback_data=f"mod:rej:{submission_id}")],
+    ]
+    if author_id is not None and not config.is_admin(author_id):
+        rows.append([InlineKeyboardButton(text="🚫 Заблокировать", callback_data=f"mod:ban:{submission_id}")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 def random_keyboard() -> InlineKeyboardMarkup:
@@ -71,31 +73,29 @@ def build_caption(text, collection, season, episode) -> str:
     return text or tag
 
 
-async def _next_episode(collection_id, season):
-    current = await db.fetchval(
-        "SELECT MAX(episode) FROM posts WHERE collection_id = ? AND season = ?",
-        (collection_id, season),
-        0,
+async def neighbour_posts(post_row):
+    """Ближайшие существующие серии (пропускает удалённые и дырки)."""
+    if not post_row or not post_row["collection_id"] or not post_row["episode"]:
+        return None, None
+    previous = await db.fetchone(
+        "SELECT * FROM posts WHERE collection_id = ? AND season = ? AND episode < ? "
+        "AND is_deleted = 0 ORDER BY episode DESC LIMIT 1",
+        (post_row["collection_id"], post_row["season"], post_row["episode"]),
     )
-    return int(current or 0) + 1
-
-
-async def _neighbour_link(collection_id, season, episode):
-    if not collection_id or not episode or episode < 1:
-        return None
-    row = await db.fetchone(
-        "SELECT message_id FROM posts WHERE collection_id = ? AND season = ? "
-        "AND episode = ? AND is_deleted = 0",
-        (collection_id, season, episode),
+    following = await db.fetchone(
+        "SELECT * FROM posts WHERE collection_id = ? AND season = ? AND episode > ? "
+        "AND is_deleted = 0 ORDER BY episode ASC LIMIT 1",
+        (post_row["collection_id"], post_row["season"], post_row["episode"]),
     )
-    return post_link(row["message_id"]) if row else None
+    return previous, following
 
 
 async def refresh_keyboard(bot: Bot, post_row):
     if not post_row or not post_row["collection_id"] or not post_row["episode"]:
         return
-    prev_link = await _neighbour_link(post_row["collection_id"], post_row["season"], post_row["episode"] - 1)
-    next_link = await _neighbour_link(post_row["collection_id"], post_row["season"], post_row["episode"] + 1)
+    previous, following = await neighbour_posts(post_row)
+    prev_link = post_link(previous["message_id"]) if previous else None
+    next_link = post_link(following["message_id"]) if following else None
     random_enabled = await db.get_bool_setting("random_button_under_posts")
     try:
         await bot.edit_message_reply_markup(
@@ -165,13 +165,26 @@ async def publish_submission(
         if collection["is_ordered"]:
             season = int(season or collection["season"])
             if episode is None:
-                episode = await _next_episode(collection_id, season)
+                episode = await collections_service.next_episode(collection_id, season)
         else:
             season = None
             episode = None
 
     caption = build_caption(caption_text, collection, season, episode)
-    prev_link = await _neighbour_link(collection_id, season, episode - 1) if (collection_id and episode) else None
+    prev_link = next_link = None
+    if collection_id and episode:
+        previous = await db.fetchone(
+            "SELECT message_id FROM posts WHERE collection_id = ? AND season = ? AND episode < ? "
+            "AND is_deleted = 0 ORDER BY episode DESC LIMIT 1",
+            (collection_id, season, episode),
+        )
+        following = await db.fetchone(
+            "SELECT message_id FROM posts WHERE collection_id = ? AND season = ? AND episode > ? "
+            "AND is_deleted = 0 ORDER BY episode ASC LIMIT 1",
+            (collection_id, season, episode),
+        )
+        prev_link = post_link(previous["message_id"]) if previous else None
+        next_link = post_link(following["message_id"]) if following else None
     random_enabled = await db.get_bool_setting("random_button_under_posts")
 
     message = await bot.copy_message(
@@ -180,15 +193,15 @@ async def publish_submission(
         message_id=submission["source_message_id"],
         caption=caption or None,
         parse_mode="HTML",
-        reply_markup=post_keyboard(prev_link, None, random_enabled),
+        reply_markup=post_keyboard(prev_link, next_link, random_enabled),
     )
 
     channel_id = config.CHANNEL_NUMERIC_ID if config.CHANNEL_NUMERIC_ID is not None else config.CHANNEL_CHAT
     try:
         cur = await db.execute(
             "INSERT INTO posts (channel_id, message_id, submission_id, collection_id, season, episode, "
-            "media_type, file_id, caption, author_id, published_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "media_type, file_id, file_unique_id, caption, author_id, published_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 channel_id,
                 message.message_id,
@@ -198,6 +211,7 @@ async def publish_submission(
                 episode,
                 submission["media_type"],
                 submission["file_id"],
+                submission["file_unique_id"],
                 caption,
                 submission["user_id"],
                 now_iso(),
@@ -216,15 +230,15 @@ async def publish_submission(
         (now_iso(), reviewer_id, submission_id),
     )
     await db.execute("UPDATE users SET approved_total = approved_total + 1 WHERE id = ?", (submission["user_id"],))
+    if collection_id and episode:
+        await collections_service.bump_episode(collection_id, episode)
 
     current = await db.fetchone("SELECT * FROM posts WHERE id = ?", (post_id,))
     await refresh_keyboard(bot, current)
-    if collection_id and episode and episode > 1:
-        previous = await db.fetchone(
-            "SELECT * FROM posts WHERE collection_id = ? AND season = ? AND episode = ? AND is_deleted = 0",
-            (collection_id, season, episode - 1),
-        )
+    if collection_id and episode:
+        previous, following = await neighbour_posts(current)
         await refresh_keyboard(bot, previous)
+        await refresh_keyboard(bot, following)
 
     link = post_link(message.message_id)
     submission = await db.fetchone("SELECT * FROM submissions WHERE id = ?", (submission_id,))

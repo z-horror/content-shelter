@@ -17,6 +17,7 @@ from aiogram.types import (
 )
 
 from app import config, db
+from app.services import submissions as submissions_service
 from app.services.publishing import card_keyboard, random_keyboard
 from app.utils import esc, human_duration, human_size, now_iso, post_link
 
@@ -91,25 +92,38 @@ async def _submissions_today(user_id: int) -> int:
 def extract_media(message: Message):
     if message.video:
         return {"type": "video", "file_id": message.video.file_id,
+                "unique_id": message.video.file_unique_id,
                 "size": message.video.file_size, "duration": message.video.duration}
     if message.animation:
         return {"type": "video", "file_id": message.animation.file_id,
+                "unique_id": message.animation.file_unique_id,
                 "size": message.animation.file_size, "duration": message.animation.duration}
     if message.photo:
         photo = message.photo[-1]
-        return {"type": "photo", "file_id": photo.file_id, "size": photo.file_size, "duration": None}
+        return {"type": "photo", "file_id": photo.file_id, "unique_id": photo.file_unique_id,
+                "size": photo.file_size, "duration": None}
     if message.document:
         mime = message.document.mime_type or ""
         if mime.startswith("video/"):
             return {"type": "video", "file_id": message.document.file_id,
+                    "unique_id": message.document.file_unique_id,
                     "size": message.document.file_size, "duration": None}
         if mime.startswith("image/"):
             return {"type": "photo", "file_id": message.document.file_id,
+                    "unique_id": message.document.file_unique_id,
                     "size": message.document.file_size, "duration": None}
     return None
 
 
 async def begin_submit(message: Message, state: FSMContext, bot: Bot, user):
+    ban = await db.fetchone("SELECT is_banned, ban_reason FROM users WHERE id = ?", (user.id,))
+    if ban and ban["is_banned"]:
+        text = "🚫 Ты не можешь отправлять заявки."
+        if ban["ban_reason"]:
+            text += f"\nПричина: {ban['ban_reason']}"
+        await message.answer(text, parse_mode=None)
+        return
+
     if not await check_subscription(bot, user.id):
         rows = []
         if config.CHANNEL_USERNAME:
@@ -143,6 +157,15 @@ async def submit_cancel_command(message: Message, state: FSMContext):
 
 @router.message(Submit.waiting_media)
 async def submit_media(message: Message, state: FSMContext, bot: Bot):
+    ban = await db.fetchone("SELECT is_banned, ban_reason FROM users WHERE id = ?", (message.from_user.id,))
+    if ban and ban["is_banned"]:
+        text = "🚫 Ты не можешь отправлять заявки."
+        if ban["ban_reason"]:
+            text += f"\nПричина: {ban['ban_reason']}"
+        await state.clear()
+        await message.answer(text, parse_mode=None)
+        return
+
     if message.media_group_id:
         await message.answer("Пришли, пожалуйста, один файл за раз (без альбомов).")
         return
@@ -173,10 +196,12 @@ async def submit_media(message: Message, state: FSMContext, bot: Bot):
         return
 
     user = message.from_user
+    comment = (message.caption or "").strip()[:300] or None
     cur = await db.execute(
-        "INSERT INTO submissions (user_id, source_chat_id, source_message_id, media_type, file_id, created_at) "
-        "VALUES (?, ?, ?, ?, ?, ?)",
-        (user.id, message.chat.id, message.message_id, media["type"], media["file_id"], now_iso()),
+        "INSERT INTO submissions (user_id, source_chat_id, source_message_id, media_type, file_id, "
+        "file_unique_id, comment_text, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        (user.id, message.chat.id, message.message_id, media["type"], media["file_id"],
+         media.get("unique_id"), comment, now_iso()),
     )
     submission_id = cur.lastrowid
 
@@ -189,8 +214,13 @@ async def submit_media(message: Message, state: FSMContext, bot: Bot):
         author += f" · @{user.username}"
     author += f" · <code>{user.id}</code>"
     card = f"📥 <b>Заявка #{submission_id}</b>\n👤 {author}\n{details}"
+    if comment:
+        card += f"\n💬 {esc(comment)}"
+    found = await submissions_service.duplicates(media.get("unique_id"), exclude_submission_id=submission_id)
+    for line in submissions_service.duplicate_lines(found):
+        card += f"\n{line}"
 
-    keyboard = card_keyboard(submission_id)
+    keyboard = card_keyboard(submission_id, user.id)
     log.info("submission #%s from %s (%s)", submission_id, user.id, media["type"])
 
     try:
@@ -451,6 +481,7 @@ STATUS_LABELS = {
     "scheduled": "🕓 запланировано",
     "approved": "✅ опубликовано",
     "rejected": "❌ отклонено",
+    "deleted": "🗑 удалено",
 }
 
 

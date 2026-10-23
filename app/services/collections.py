@@ -22,10 +22,22 @@ async def create_collection(name: str, is_ordered: bool) -> int:
     return cur.lastrowid
 
 
-async def next_episode(collection_id: int, season: int) -> int:
-    current = await db.fetchval(
+async def next_episode(collection_id: int, season: int = 1) -> int:
+    last = await db.fetchval(
+        "SELECT last_episode FROM collections WHERE id = ?", (collection_id,), 0
+    )
+    max_post = await db.fetchval(
         "SELECT MAX(episode) FROM posts WHERE collection_id = ? AND season = ?",
         (collection_id, season),
         0,
     )
-    return int(current or 0) + 1
+    return max(int(last or 0), int(max_post or 0)) + 1
+
+
+async def bump_episode(collection_id: int, episode: int):
+    if not collection_id or not episode:
+        return
+    await db.execute(
+        "UPDATE collections SET last_episode = MAX(last_episode, ?) WHERE id = ?",
+        (int(episode), collection_id),
+    )

@@ -11,7 +11,7 @@ from app import config, db, sessions
 from app.services import collections as collections_service
 from app.services import publishing
 from app.keyboards import schedule_keyboard
-from app.utils import esc, format_local
+from app.utils import esc, format_local, post_link
 
 log = logging.getLogger(__name__)
 
@@ -47,6 +47,10 @@ class NewCol(StatesGroup):
     name = State()
 
 
+class EditCaption(StatesGroup):
+    value = State()
+
+
 def _btn(text, data=None, url=None):
     if url:
         return InlineKeyboardButton(text=text, url=url)
@@ -56,12 +60,13 @@ def _btn(text, data=None, url=None):
 async def menu_keyboard():
     pending = int(await db.fetchval("SELECT COUNT(*) FROM submissions WHERE status = 'pending'", default=0))
     scheduled = int(await db.fetchval("SELECT COUNT(*) FROM queue WHERE status = 'waiting'", default=0))
-    queue_label = "📥 Очередь" + (f" ({pending})" if pending else "")
+    queue_label = "📥 Заявки" + (f" ({pending})" if pending else "")
     plan_label = "🗓 Отложено" + (f" ({scheduled})" if scheduled else "")
     return InlineKeyboardMarkup(inline_keyboard=[
         [_btn(queue_label, "adm:queue"), _btn(plan_label, "adm:sched")],
         [_btn("📁 Подборки", "adm:cols"), _btn("⚙️ Настройки", "adm:set")],
         [_btn("📊 Статистика", "adm:stats"), _btn("🔧 Сервис", "adm:svc")],
+        [_btn("🚫 Баны", "adm:bans")],
         [_btn("⬅️ В меню", "u:menu")],
     ])
 
@@ -135,7 +140,7 @@ async def cb_queue_show(callback: CallbackQuery, bot: Bot):
             message_id=submission["source_message_id"],
             caption=card,
             parse_mode="HTML",
-            reply_markup=publishing.card_keyboard(submission_id),
+            reply_markup=publishing.card_keyboard(submission_id, submission["user_id"]),
             message_thread_id=config.ADMIN_TOPIC_ID,
         )
     except Exception as error:  # noqa: BLE001
@@ -303,8 +308,16 @@ async def cb_sched_cancel(callback: CallbackQuery, bot: Bot):
             bot,
             submission,
             "⏳ Возвращено в очередь",
-            keyboard=publishing.card_keyboard(row["submission_id"]),
+            keyboard=publishing.card_keyboard(row["submission_id"], submission["user_id"]),
         )
+        try:
+            await bot.send_message(
+                submission["user_id"],
+                "🗓 Публикация отменена, заявка снова на модерации.",
+                parse_mode=None,
+            )
+        except Exception:  # noqa: BLE001
+            pass
     await callback.answer("Отменено")
     await callback.message.answer(
         f"Заявка #{row['submission_id']} снята с публикации и вернулась в очередь."
@@ -419,6 +432,7 @@ async def cb_collection_view(callback: CallbackQuery):
     )
     toggle_text = "📁 Сделать папкой" if row["is_ordered"] else "📺 Сделать сериалом"
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [_btn(f"📄 Посты ({count})", f"ap:list:{collection_id}:0")],
         [_btn("✏️ Переименовать", f"ac:ren:{collection_id}")],
         [_btn(toggle_text, f"ac:type:{collection_id}")],
         [_btn("⬆️ Выше", f"ac:up:{collection_id}"), _btn("⬇️ Ниже", f"ac:dn:{collection_id}")],
@@ -645,3 +659,248 @@ async def on_setting_value(message: Message, state: FSMContext):
     await db.set_setting(key, raw)
     await state.clear()
     await message.answer(f"«{label}» обновлено.", reply_markup=await menu_keyboard())
+
+PAGE = 10
+
+
+async def _send_post_list(target, collection_id: int, page: int):
+    collection = await db.fetchone("SELECT * FROM collections WHERE id = ?", (collection_id,))
+    if collection is None:
+        await target.answer("Подборка не найдена.")
+        return
+    total = int(await db.fetchval(
+        "SELECT COUNT(*) FROM posts WHERE collection_id = ?", (collection_id,), 0
+    ))
+    page = max(0, page)
+    rows = await db.fetchall(
+        "SELECT * FROM posts WHERE collection_id = ? ORDER BY COALESCE(season, 0), "
+        "COALESCE(episode, 0), id LIMIT ? OFFSET ?",
+        (collection_id, PAGE, page * PAGE),
+    )
+    if not rows:
+        await target.answer("В подборке пока нет постов.")
+        return
+    keyboard = []
+    row = []
+    for post in rows:
+        label = f"S{int(post['season'] or 1)}E{int(post['episode'])}" if post["episode"] else f"#{post['id']}"
+        if post["is_deleted"]:
+            label = "🙈 " + label
+        row.append(_btn(label, f"ap:v:{post['id']}:{collection_id}:{page}"))
+        if len(row) == 2:
+            keyboard.append(row)
+            row = []
+    if row:
+        keyboard.append(row)
+    navigation = []
+    if page > 0:
+        navigation.append(_btn("⬅️", f"ap:list:{collection_id}:{page - 1}"))
+    if (page + 1) * PAGE < total:
+        navigation.append(_btn("➡️", f"ap:list:{collection_id}:{page + 1}"))
+    if navigation:
+        keyboard.append(navigation)
+    keyboard.append([_btn("⬅️ К подборке", f"ac:v:{collection_id}")])
+    await target.answer(
+        f"📄 <b>{esc(collection['name'])}</b> · постов: {total}\n"
+        "Нажми на серию, чтобы открыть карточку поста.",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard),
+    )
+
+
+async def _send_post_card(target, post_id: int, collection_id: int, page: int):
+    post = await db.fetchone("SELECT * FROM posts WHERE id = ?", (post_id,))
+    if post is None:
+        await target.answer("Пост не найден.")
+        return
+    collection = None
+    if post["collection_id"]:
+        collection = await db.fetchone("SELECT * FROM collections WHERE id = ?", (post["collection_id"],))
+    lines = ["📄 Карточка поста"]
+    if collection is not None:
+        lines.append(f"Подборка: {esc(collection['name'])}")
+    if post["episode"]:
+        lines.append(f"Серия: S{int(post['season'] or 1)}E{int(post['episode'])}")
+    lines.append(f"Опубликован: {format_local(post['published_at'])}")
+    if post["is_deleted"]:
+        lines.append("🙈 Скрыт из подборок")
+    if post["caption"]:
+        caption = post["caption"]
+        if len(caption) > 250:
+            caption = caption[:247] + "..."
+        lines.append("")
+        lines.append(caption)
+
+    keyboard = [
+        [
+            _btn("✏️ Подпись", f"ap:cap:{post_id}:{collection_id}:{page}"),
+            _btn("👁 Вернуть" if post["is_deleted"] else "🙈 Скрыть", f"ap:hide:{post_id}:{collection_id}:{page}"),
+        ],
+        [_btn("🗑 Удалить пост", f"ap:del:{post_id}:{collection_id}:{page}")],
+    ]
+    link = post_link(post["message_id"])
+    if link:
+        keyboard.append([_btn("🔗 Открыть в канале", url=link)])
+    keyboard.append([_btn("⬅️ К списку", f"ap:list:{collection_id}:{page}")])
+    await target.answer("\n".join(lines), reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard))
+
+
+@router.callback_query(F.data.startswith("ap:list:"), IsAdmin())
+async def cb_post_list(callback: CallbackQuery):
+    await callback.answer()
+    _, _, collection_id, page = callback.data.split(":")
+    await _send_post_list(callback.message, int(collection_id), int(page))
+
+
+@router.callback_query(F.data.startswith("ap:v:"), IsAdmin())
+async def cb_post_view(callback: CallbackQuery):
+    await callback.answer()
+    _, _, post_id, collection_id, page = callback.data.split(":")
+    await _send_post_card(callback.message, int(post_id), int(collection_id), int(page))
+
+
+@router.callback_query(F.data.startswith("ap:cap:"), IsAdmin())
+async def cb_post_caption(callback: CallbackQuery, state: FSMContext):
+    await callback.answer()
+    _, _, post_id, collection_id, page = callback.data.split(":")
+    await state.set_state(EditCaption.value)
+    await state.update_data(post_id=int(post_id), collection_id=int(collection_id), page=int(page))
+    await callback.message.answer(
+        "Пришли новый текст подписи. Хештег и номер серии добавятся автоматически. "
+        "Или /skip, чтобы оставить только тег.",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[_btn("✖️ Отмена", "adm:cancel")]]),
+    )
+
+
+@router.message(EditCaption.value, IsAdmin())
+async def on_post_caption(message: Message, state: FSMContext, bot: Bot):
+    data = await state.get_data()
+    text = (message.text or "").strip()
+    if text == "/skip":
+        caption_text = None
+    elif text.startswith("/"):
+        await message.answer("Пришли текст или /skip.")
+        return
+    else:
+        caption_text = text[:900]
+
+    post = await db.fetchone("SELECT * FROM posts WHERE id = ?", (data["post_id"],))
+    if post is None:
+        await state.clear()
+        await message.answer("Пост не найден.")
+        return
+    collection = None
+    if post["collection_id"]:
+        collection = await db.fetchone("SELECT * FROM collections WHERE id = ?", (post["collection_id"],))
+    caption = publishing.build_caption(caption_text, collection, post["season"], post["episode"])
+    try:
+        await bot.edit_message_caption(
+            chat_id=post["channel_id"],
+            message_id=post["message_id"],
+            caption=caption,
+            parse_mode="HTML",
+        )
+    except TelegramBadRequest as error:
+        await message.answer(f"Не удалось изменить подпись: {esc(error)}")
+        return
+    await db.execute("UPDATE posts SET caption = ? WHERE id = ?", (caption, post["id"]))
+    await state.clear()
+    await message.answer("Подпись обновлена.")
+
+
+@router.callback_query(F.data.startswith("ap:hide:"), IsAdmin())
+async def cb_post_hide(callback: CallbackQuery, bot: Bot):
+    _, _, post_id, collection_id, page = callback.data.split(":")
+    post = await db.fetchone("SELECT * FROM posts WHERE id = ?", (int(post_id),))
+    if post is None:
+        await callback.answer("Пост не найден", show_alert=True)
+        return
+    previous, following = await publishing.neighbour_posts(post)
+    new_value = 0 if post["is_deleted"] else 1
+    await db.execute("UPDATE posts SET is_deleted = ? WHERE id = ?", (new_value, post["id"]))
+    await publishing.refresh_keyboard(bot, previous)
+    await publishing.refresh_keyboard(bot, following)
+    await callback.answer("Скрыт" if new_value else "Возвращён")
+    await _send_post_card(callback.message, int(post_id), int(collection_id), int(page))
+
+
+@router.callback_query(F.data.startswith("ap:del:"), IsAdmin())
+async def cb_post_delete(callback: CallbackQuery):
+    await callback.answer()
+    _, _, post_id, collection_id, page = callback.data.split(":")
+    post = await db.fetchone("SELECT * FROM posts WHERE id = ?", (int(post_id),))
+    if post is None:
+        await callback.message.answer("Пост не найден.")
+        return
+    await callback.message.answer(
+        "Удалить пост из канала и запись из базы? Действие необратимо."
+        "\nНомера серий переиспользоваться не будут.",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [_btn("🗑 Да, удалить", f"ap:delok:{post_id}:{collection_id}:{page}")],
+            [_btn("⬅️ Отмена", f"ap:v:{post_id}:{collection_id}:{page}")],
+        ]),
+    )
+
+
+@router.callback_query(F.data.startswith("ap:delok:"), IsAdmin())
+async def cb_post_delete_ok(callback: CallbackQuery, bot: Bot):
+    _, _, post_id, collection_id, page = callback.data.split(":")
+    post = await db.fetchone("SELECT * FROM posts WHERE id = ?", (int(post_id),))
+    if post is None:
+        await callback.answer("Пост не найден", show_alert=True)
+        return
+    previous, following = await publishing.neighbour_posts(post)
+    if post["collection_id"] and post["episode"]:
+        await collections_service.bump_episode(post["collection_id"], post["episode"])
+    try:
+        await bot.delete_message(post["channel_id"], post["message_id"])
+    except TelegramBadRequest:
+        pass
+    await db.execute("DELETE FROM posts WHERE id = ?", (post["id"],))
+    if post["submission_id"]:
+        await db.execute(
+            "UPDATE submissions SET status = 'deleted' WHERE id = ? AND status = 'approved'",
+            (post["submission_id"],),
+        )
+    await publishing.refresh_keyboard(bot, previous)
+    await publishing.refresh_keyboard(bot, following)
+    await callback.answer("Удалено")
+    await _send_post_list(callback.message, int(collection_id), int(page))
+
+
+@router.callback_query(F.data == "adm:bans", IsAdmin())
+async def cb_bans(callback: CallbackQuery):
+    await callback.answer()
+    rows = await db.fetchall(
+        "SELECT id, username, first_name, ban_reason, banned_at FROM users "
+        "WHERE is_banned = 1 ORDER BY banned_at DESC"
+    )
+    if not rows:
+        await callback.message.answer("🚫 Забаненных нет.")
+        return
+    lines = [f"🚫 Забанено: {len(rows)}", ""]
+    keyboard = []
+    for row in rows:
+        name = f"@{row['username']}" if row["username"] else (row["first_name"] or str(row["id"]))
+        lines.append(f"• {name} · <code>{row['id']}</code>")
+        if row["ban_reason"]:
+            lines.append(f"  причина: {esc(row['ban_reason'])}")
+        if row["banned_at"]:
+            lines.append(f"  с {format_local(row['banned_at'])}")
+        keyboard.append([_btn(f"✅ Разбанить {name}", f"ban:off:{row['id']}")])
+    keyboard.append([_btn("⬅️ Назад", "adm:menu")])
+    await callback.message.answer("\n".join(lines), reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard))
+
+
+@router.callback_query(F.data.startswith("ban:off:"), IsAdmin())
+async def cb_unban(callback: CallbackQuery, bot: Bot):
+    user_id = int(callback.data.split(":")[2])
+    await db.execute(
+        "UPDATE users SET is_banned = 0, ban_reason = NULL, banned_at = NULL WHERE id = ?",
+        (user_id,),
+    )
+    try:
+        await bot.send_message(user_id, "✅ Блокировка снята, можешь снова отправлять заявки.", parse_mode=None)
+    except Exception:  # noqa: BLE001
+        pass
+    await callback.answer("Разбанен")
+    await callback.message.answer(f"Пользователь {user_id} разбанен.")

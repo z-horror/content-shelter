@@ -8,6 +8,7 @@ from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMar
 from app import config, db, sessions
 from app.services import collections as collections_service
 from app.services import publishing
+from app.services import submissions as submissions_service
 from app.keyboards import schedule_keyboard
 from app.utils import esc, format_local, now_iso, parse_user_datetime, preset_datetime
 
@@ -120,6 +121,22 @@ async def card_action(callback: CallbackQuery, bot: Bot):
         await sessions.set_session(admin_id, step="reject", submission_id=submission_id)
         ok = await _dm(bot, admin_id,
                        f"Заявка #{submission_id}. Причина отклонения (текст) или /skip.",
+                       cancel_kb, reply_to=callback.message.message_id,
+                       mention=callback.from_user.mention_html())
+        if not ok:
+            await callback.answer("Открой бота в личке и нажми /start", show_alert=True)
+        else:
+            await callback.answer()
+        return
+
+    if action == "ban":
+        if is_admin(submission["user_id"]):
+            await callback.answer("Нельзя заблокировать админа", show_alert=True)
+            return
+        await sessions.set_session(admin_id, step="ban_reason", submission_id=submission_id,
+                                   target_user=submission["user_id"])
+        ok = await _dm(bot, admin_id,
+                       f"Заявка #{submission_id}. Причина блокировки (текст) или /skip.",
                        cancel_kb, reply_to=callback.message.message_id,
                        mention=callback.from_user.mention_html())
         if not ok:
@@ -426,6 +443,7 @@ async def schedule_preset(callback: CallbackQuery, bot: Bot):
     await sessions.clear_session(admin_id)
     await callback.answer("Время изменено")
     await _dm(bot, admin_id, f"🕓 Новое время: {format_local(publish_at)}.")
+    await _notify_author(bot, row["submission_id"], f"🕓 Публикация перенесена на {format_local(publish_at)}.")
 
 
 @router.message(SessionStep("time"))
@@ -478,6 +496,45 @@ async def on_reschedule_time(message: Message, bot: Bot):
         return
     await db.execute("UPDATE queue SET publish_at = ? WHERE id = ?", (publish_at, queue_id))
     await message.answer(f"🕓 Новое время: {format_local(publish_at)}.")
+    await _notify_author(bot, row["submission_id"], f"🕓 Публикация перенесена на {format_local(publish_at)}.")
+
+
+@router.message(SessionStep("ban_reason"))
+async def on_ban_reason(message: Message, bot: Bot):
+    text = _normalize(message.text)
+    reason = None if text == "/skip" else text[:300]
+    session = await sessions.get_session(message.from_user.id)
+    if not session:
+        return
+    admin_id = message.from_user.id
+    await sessions.clear_session(admin_id)
+
+    submission_id = int(session["submission_id"])
+    target_user = int(session.get("target_user") or 0)
+    if not target_user:
+        await message.answer("Не понял, кого блокировать.")
+        return
+
+    await db.execute(
+        "UPDATE users SET is_banned = 1, ban_reason = ?, banned_at = ? WHERE id = ?",
+        (reason, now_iso(), target_user),
+    )
+    submission = await db.fetchone("SELECT * FROM submissions WHERE id = ?", (submission_id,))
+    if submission is not None and submission["status"] == "pending":
+        await db.execute(
+            "UPDATE submissions SET status = 'rejected', reject_reason = ?, reviewed_at = ?, reviewer_id = ? "
+            "WHERE id = ?",
+            ("автор заблокирован", now_iso(), admin_id, submission_id),
+        )
+        await publishing.edit_card(bot, submission, "🚫 Автор заблокирован")
+    try:
+        notice = "🚫 Ты больше не можешь отправлять заявки."
+        if reason:
+            notice += f"\nПричина: {reason}"
+        await bot.send_message(target_user, notice, parse_mode=None)
+    except (TelegramForbiddenError, TelegramBadRequest):
+        pass
+    await message.answer("Пользователь заблокирован.")
 
 
 @router.message(SessionStep("reject"))
@@ -521,6 +578,16 @@ async def flow_cancel(callback: CallbackQuery):
     await callback.answer("Отменено")
     await callback.message.answer("Отменено.")
 
+async def _notify_author(bot: Bot, submission_id: int, text: str):
+    user_id = await db.fetchval("SELECT user_id FROM submissions WHERE id = ?", (submission_id,))
+    if not user_id:
+        return
+    try:
+        await bot.send_message(user_id, text, parse_mode=None)
+    except (TelegramForbiddenError, TelegramBadRequest):
+        pass
+
+
 @router.message(F.chat.id == config.ADMIN_CHAT, F.video | F.photo | F.document)
 async def admin_direct_upload(message: Message, bot: Bot):
     if message.from_user is None or not is_admin(message.from_user.id):
@@ -542,10 +609,12 @@ async def admin_direct_upload(message: Message, bot: Bot):
         "ON CONFLICT(id) DO UPDATE SET username = excluded.username, first_name = excluded.first_name",
         (user.id, user.username, user.first_name, now_iso()),
     )
+    comment = (message.caption or "").strip()[:300] or None
     cur = await db.execute(
-        "INSERT INTO submissions (user_id, source_chat_id, source_message_id, media_type, file_id, created_at) "
-        "VALUES (?, ?, ?, ?, ?, ?)",
-        (user.id, message.chat.id, message.message_id, media["type"], media["file_id"], now_iso()),
+        "INSERT INTO submissions (user_id, source_chat_id, source_message_id, media_type, file_id, "
+        "file_unique_id, comment_text, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        (user.id, message.chat.id, message.message_id, media["type"], media["file_id"],
+         media.get("unique_id"), comment, now_iso()),
     )
     submission_id = cur.lastrowid
 
@@ -555,7 +624,12 @@ async def admin_direct_upload(message: Message, bot: Bot):
         f"👤 {user.mention_html()}\n"
         f"📦 {media_title} (загружено в админ-чат)"
     )
-    sent = await message.reply(card, reply_markup=publishing.card_keyboard(submission_id))
+    if comment:
+        card += f"\n💬 {esc(comment)}"
+    found = await submissions_service.duplicates(media.get("unique_id"), exclude_submission_id=submission_id)
+    for line in submissions_service.duplicate_lines(found):
+        card += f"\n{line}"
+    sent = await message.reply(card, reply_markup=publishing.card_keyboard(submission_id, user.id))
     await db.execute(
         "UPDATE submissions SET admin_chat_id = ?, admin_message_id = ?, card_caption = ? WHERE id = ?",
         (message.chat.id, sent.message_id, card, submission_id),
