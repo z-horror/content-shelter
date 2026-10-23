@@ -12,12 +12,14 @@ def copy_method():
 
 
 class FakeBot:
-    def __init__(self, copy_errors=None, delay=0.0):
+    def __init__(self, copy_errors=None, delay=0.0, send_error=None):
         self.copy_errors = list(copy_errors or [])
         self.delay = delay
         self.copy_calls = 0
         self.deleted = []
         self.messages = []
+        self.sent = []
+        self.send_error = send_error
 
     async def copy_message(self, **kwargs):
         self.copy_calls += 1
@@ -43,6 +45,24 @@ class FakeBot:
 
     async def send_message(self, chat_id, text, **kwargs):
         self.messages.append((chat_id, text))
+
+    async def send_video(self, **kwargs):
+        if self.send_error:
+            raise self.send_error
+        self.sent.append(("video", kwargs.get("caption")))
+        return types.SimpleNamespace(
+            message_id=2000 + len(self.sent),
+            video=types.SimpleNamespace(file_id="video-file-id", file_unique_id="video-unique-id"),
+        )
+
+    async def send_document(self, **kwargs):
+        if self.send_error:
+            raise self.send_error
+        self.sent.append(("document", kwargs.get("caption")))
+        return types.SimpleNamespace(
+            message_id=3000 + len(self.sent),
+            document=types.SimpleNamespace(file_id="doc-file-id", file_unique_id="doc-unique-id"),
+        )
 
 
 async def seed_user(user_id=1, username="user", first_name="User"):

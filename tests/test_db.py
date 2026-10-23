@@ -66,9 +66,9 @@ def test_migration_from_v1_preserves_rows():
         await db.init()
         try:
             version = await db.fetchval("PRAGMA user_version")
-            assert version == 3
+            assert version == 4
             cols = {row[1] for row in await db.fetchall("PRAGMA table_info(submissions)")}
-            assert {"file_unique_id", "comment_text", "publishing_at"} <= cols
+            assert {"file_unique_id", "comment_text", "publishing_at", "source_url", "source_meta"} <= cols
             user = await db.fetchone("SELECT * FROM users WHERE id = 7")
             assert user is not None and user["username"] == "old"
             submission = await db.fetchone("SELECT * FROM submissions WHERE id = 3")
@@ -86,7 +86,7 @@ def test_migration_is_idempotent():
         await db.close()
         await db.init()
         try:
-            assert await db.fetchval("PRAGMA user_version") == 3
+            assert await db.fetchval("PRAGMA user_version") == 4
         finally:
             await db.close()
 

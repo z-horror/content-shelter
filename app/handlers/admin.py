@@ -24,6 +24,7 @@ SETTINGS = [
     ("photo_max_mb", "Макс. размер фото, МБ", "int"),
     ("require_subscription", "Только подписчики", "bool"),
     ("random_button_under_posts", "Кнопка «Случайный» под постами", "bool"),
+    ("link_upload_enabled", "Загрузка по ссылкам (YouTube/Instagram)", "bool"),
     ("rules_text", "Текст «Правила»", "text"),
 ]
 SETTINGS_MAP = {row[0]: row for row in SETTINGS}

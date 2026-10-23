@@ -10,6 +10,7 @@ from aiogram.types import BotCommand, ErrorEvent
 from app import config, db
 from app.handlers import admin, moderation, user
 from app.scheduler import scheduler_loop
+from app.services import link_download
 
 log = logging.getLogger(__name__)
 
@@ -63,6 +64,7 @@ async def main():
         raise SystemExit("BOT_TOKEN is not set (check .env)")
 
     await db.init()
+    link_download.cleanup_stale()
     await db.execute("DELETE FROM admin_sessions WHERE updated_at < datetime('now', '-1 day')")
 
     bot = Bot(

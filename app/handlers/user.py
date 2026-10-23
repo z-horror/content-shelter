@@ -1,4 +1,7 @@
+import html
+import json
 import logging
+import re
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 
@@ -17,9 +20,11 @@ from aiogram.types import (
 )
 
 from app import config, db
+from app.services import link_download, link_flow
 from app.services import submissions as submissions_service
 from app.services.publishing import card_keyboard, random_keyboard
-from app.utils import esc, human_duration, human_size, now_iso, post_link
+from app.utils import (esc, format_local, format_local_day, format_local_short,
+                       human_duration, human_size, now_iso, post_link)
 
 log = logging.getLogger(__name__)
 
@@ -30,6 +35,7 @@ router.callback_query.filter(F.data.startswith("u:"))
 
 class Submit(StatesGroup):
     waiting_media = State()
+    waiting_link = State()
 
 
 def _btn(text, data=None, url=None):
@@ -140,10 +146,35 @@ async def begin_submit(message: Message, state: FSMContext, bot: Bot, user):
         await message.answer(f"Лимит заявок на сегодня исчерпан ({limit} в сутки). Приходи завтра.")
         return
 
+    link_enabled = await db.get_bool_setting("link_upload_enabled", True)
+    if not link_enabled:
+        await _prompt_file(message, state)
+        return
+
+    await state.clear()
+    await message.answer(
+        "Как отправить видео?",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [_btn("📎 Отправить файл", "u:file"), _btn("🔗 Отправить ссылку", "u:link")],
+            [_btn("✖️ Отмена", "u:cancel")],
+        ]),
+    )
+
+
+async def _prompt_file(message: Message, state: FSMContext):
     await state.set_state(Submit.waiting_media)
     await message.answer(
         "Пришли одно видео или фото.\n"
         "Одна заявка = один файл. Можно добавить подпись — она не публикуется, это просто комментарий.",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[_btn("✖️ Отмена", "u:cancel")]]),
+    )
+
+
+async def _prompt_link(message: Message, state: FSMContext):
+    await state.set_state(Submit.waiting_link)
+    await message.answer(
+        "Пришли ссылку на YouTube или Instagram (Reels/видео).\n"
+        "Скачаю и передам в модерацию. Ограничения: до 50 МБ и 10 минут.",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[[_btn("✖️ Отмена", "u:cancel")]]),
     )
 
@@ -293,6 +324,23 @@ async def cb_cancel(callback: CallbackQuery, state: FSMContext):
     await main_menu(callback.message, callback.from_user.id)
 
 
+@router.callback_query(F.data == "u:file")
+async def cb_file(callback: CallbackQuery, state: FSMContext):
+    await ensure_user(callback.from_user)
+    await callback.answer()
+    await _prompt_file(callback.message, state)
+
+
+@router.callback_query(F.data == "u:link")
+async def cb_link(callback: CallbackQuery, state: FSMContext):
+    await ensure_user(callback.from_user)
+    if not await db.get_bool_setting("link_upload_enabled", True):
+        await callback.answer("Загрузка по ссылкам отключена", show_alert=True)
+        return
+    await callback.answer()
+    await _prompt_link(callback.message, state)
+
+
 @router.callback_query(F.data.in_({"u:submit", "u:check"}))
 async def cb_submit(callback: CallbackQuery, state: FSMContext, bot: Bot):
     await ensure_user(callback.from_user)
@@ -316,7 +364,7 @@ async def cb_collections(callback: CallbackQuery):
 async def show_collections(message: Message):
     rows = await db.fetchall(
         "SELECT c.*, (SELECT COUNT(*) FROM posts p WHERE p.collection_id = c.id AND p.is_deleted = 0) AS cnt "
-        "FROM collections c ORDER BY c.position, c.id"
+        "FROM collections c ORDER BY c.is_ordered DESC, c.position, c.id"
     )
     items = [row for row in rows if row["cnt"] > 0]
     if not items:
@@ -327,7 +375,8 @@ async def show_collections(message: Message):
         name = row["name"]
         if len(name) > 40:
             name = name[:37] + "..."
-        keyboard.append([_btn(f"📁 {name} ({row['cnt']})", f"u:c:{row['id']}:0")])
+        icon = "📺" if row["is_ordered"] else "📁"
+        keyboard.append([_btn(f"{icon} {name} ({row['cnt']})", f"u:c:{row['id']}:0")])
     keyboard.append([_btn("⬅️ В меню", "u:menu")])
     await message.answer(
         "📚 Подборки:",
@@ -338,6 +387,42 @@ async def show_collections(message: Message):
 PAGE_SIZE = 10
 
 
+def _plural(number: int, one: str, few: str, many: str) -> str:
+    if number % 10 == 1 and number % 100 != 11:
+        return one
+    if number % 10 in (2, 3, 4) and number % 100 not in (12, 13, 14):
+        return few
+    return many
+
+
+def _plain_title(caption):
+    if not caption:
+        return None
+    text = html.unescape(re.sub(r"<[^>]+>", "", caption))
+    for line in text.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        if line.startswith("#") or re.match(r"^https?://", line):
+            return None
+        return line[:40]
+    return None
+
+
+def _author_label(row):
+    if row["username"]:
+        return f"@{row['username']}"
+    if row["first_name"]:
+        return row["first_name"]
+    return "из канала"
+
+
+def _series_label(season, episode, default_season=1):
+    if not episode:
+        return ""
+    return f"S{int(season or default_season)}E{int(episode)}"
+
+
 async def _collection_page(collection_id: int, page: int):
     total = int(await db.fetchval(
         "SELECT COUNT(*) FROM posts WHERE collection_id = ? AND is_deleted = 0",
@@ -346,25 +431,40 @@ async def _collection_page(collection_id: int, page: int):
     ))
     offset = max(page, 0) * PAGE_SIZE
     rows = await db.fetchall(
-        "SELECT * FROM posts WHERE collection_id = ? AND is_deleted = 0 "
-        "ORDER BY COALESCE(season, 0), COALESCE(episode, 0), id LIMIT ? OFFSET ?",
+        "SELECT p.*, u.username, u.first_name FROM posts p "
+        "LEFT JOIN users u ON u.id = p.author_id "
+        "WHERE p.collection_id = ? AND p.is_deleted = 0 "
+        "ORDER BY COALESCE(p.season, 0), COALESCE(p.episode, 0), p.id LIMIT ? OFFSET ?",
         (collection_id, PAGE_SIZE, offset),
     )
     return total, rows
 
 
 def _render_collection(collection, rows, total, page):
-    lines = [f"📁 <b>{esc(collection['name'])}</b>", f"Всего: {total}", ""]
+    icon = "📺" if collection["is_ordered"] else "📁"
+    if collection["is_ordered"]:
+        count = f"{total} {_plural(total, 'серия', 'серии', 'серий')}"
+    else:
+        count = f"{total} {_plural(total, 'пост', 'поста', 'постов')}"
+    lines = [f"{icon} <b>{esc(collection['name'])}</b>", count, ""]
     for index, row in enumerate(rows, start=page * PAGE_SIZE + 1):
-        if row["episode"]:
-            label = f"S{int(row['season'] or collection['season'])}E{int(row['episode'])}"
-        else:
-            label = f"{index}."
+        date = format_local_day(row["published_at"])
+        author = esc(_author_label(row))
         link = post_link(row["message_id"])
-        if link:
-            lines.append(f'• {label} — <a href="{link}">смотреть</a>')
+        if collection["is_ordered"] and row["episode"]:
+            label = _series_label(row["season"], row["episode"], collection["season"])
+            text = f"{label} · {date} · {author}"
         else:
-            lines.append(f"• {label}")
+            kind = "🎬" if row["media_type"] == "video" else "🖼"
+            title = _plain_title(row["caption"])
+            if title:
+                text = f"{index}. {kind} «{esc(title)}» · {date} · {author}"
+            else:
+                text = f"{index}. {kind} без названия · {date} · {author}"
+        if link:
+            lines.append(f'{text} — <a href="{link}">смотреть</a>')
+        else:
+            lines.append(text)
     return "\n".join(lines)
 
 
@@ -489,29 +589,183 @@ STATUS_LABELS = {
     "deleted": "🗑 удалено",
 }
 
+STATUS_EMOJI = {
+    "pending": "⏳",
+    "scheduled": "🕓",
+    "approved": "✅",
+    "rejected": "❌",
+}
+
+MY_PAGE_SIZE = 10
+
+MY_SELECT = """
+SELECT s.*,
+       p.message_id AS post_message_id,
+       p.published_at AS post_published_at,
+       p.caption AS post_caption,
+       p.season AS post_season,
+       p.episode AS post_episode,
+       pc.name AS post_collection,
+       q.publish_at AS publish_at,
+       q.caption AS sched_caption,
+       q.season AS sched_season,
+       q.episode AS sched_episode,
+       qc.name AS sched_collection
+FROM submissions s
+LEFT JOIN posts p ON p.id = (SELECT MAX(id) FROM posts WHERE submission_id = s.id)
+LEFT JOIN collections pc ON pc.id = p.collection_id
+LEFT JOIN queue q ON q.id = (
+    SELECT MAX(id) FROM queue WHERE submission_id = s.id AND status = 'waiting'
+)
+LEFT JOIN collections qc ON qc.id = q.collection_id
+WHERE s.user_id = ? AND s.status != 'deleted'
+"""
+
+
+async def _my_rows(user_id, limit=None, offset=0):
+    sql = MY_SELECT + " ORDER BY s.id DESC"
+    params = [user_id]
+    if limit is not None:
+        sql += " LIMIT ? OFFSET ?"
+        params += [limit, offset]
+    return await db.fetchall(sql, tuple(params))
+
+
+async def _my_row(user_id, submission_id):
+    return await db.fetchone(MY_SELECT + " AND s.id = ?", (user_id, submission_id))
+
+
+def _my_line(row):
+    status = row["status"]
+    if status == "scheduled":
+        when = format_local_short(row["publish_at"]) if row["publish_at"] else format_local_day(row["created_at"])
+        episode = _series_label(row["sched_season"], row["sched_episode"])
+        return f"#{row['id']} · 🕓 {when}{(' · ' + episode) if episode else ''}", None
+    if status == "approved":
+        when = format_local_day(row["post_published_at"] or row["created_at"])
+        episode = _series_label(row["post_season"], row["post_episode"])
+        text = f"#{row['id']} · ✅ {when}{(' · ' + episode) if episode else ''}"
+        link = post_link(row["post_message_id"]) if row["post_message_id"] else None
+        return text, link
+    if status == "rejected":
+        return f"#{row['id']} · ❌ {format_local_day(row['created_at'])}", None
+    return f"#{row['id']} · ⏳ {format_local_day(row['created_at'])}", None
+
 
 async def show_my(message: Message):
-    rows = await db.fetchall(
-        "SELECT s.*, p.message_id AS post_message_id FROM submissions s "
-        "LEFT JOIN posts p ON p.submission_id = s.id "
-        "WHERE s.user_id = ? ORDER BY s.id DESC LIMIT 20",
-        (message.chat.id,),
-    )
+    rows = await _my_rows(message.chat.id, limit=10)
     if not rows:
+        await message.answer(
+            "Ты ещё ничего не присылал.",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[[_btn("⬅️ В меню", "u:menu")]]),
+        )
+        return
+
+    lines = ["📋 Твои заявки", ""]
+    for row in rows:
+        text, link = _my_line(row)
+        if link:
+            lines.append(f'<a href="{link}">{esc(text)}</a>')
+        else:
+            lines.append(esc(text))
+
+    await message.answer(
+        "\n".join(lines),
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [_btn("🔍 Детали", "u:mylist:0"), _btn("📚 Подборки", "u:cols")],
+            [_btn("⬅️ В меню", "u:menu")],
+        ]),
+    )
+
+
+async def _show_my_list(message: Message, user_id: int, page: int):
+    total = int(await db.fetchval(
+        "SELECT COUNT(*) FROM submissions WHERE user_id = ? AND status != 'deleted'",
+        (user_id,),
+        0,
+    ))
+    if total == 0:
         await message.answer("Ты ещё ничего не присылал.")
         return
-    lines = ["📋 Твои заявки:", ""]
+    page = max(0, min(page, (total - 1) // MY_PAGE_SIZE))
+    rows = await _my_rows(user_id, limit=MY_PAGE_SIZE, offset=page * MY_PAGE_SIZE)
+    keyboard = []
     for row in rows:
-        status = STATUS_LABELS.get(row["status"], row["status"])
-        line = f"#{row['id']} · {status}"
-        if row["status"] == "rejected" and row["reject_reason"]:
-            line += f" — {esc(row['reject_reason'])}"
-        if row["post_message_id"]:
-            link = post_link(row["post_message_id"])
-            if link:
-                line += f"\n<a href=\"{link}\">Открыть пост</a>"
-        lines.append(line)
-    await message.answer("\n".join(lines))
+        emoji = STATUS_EMOJI.get(row["status"], "•")
+        keyboard.append([
+            _btn(
+                f"#{row['id']} · {emoji} {format_local_day(row['created_at'])}",
+                f"u:mycard:{row['id']}:{page}",
+            )
+        ])
+    navigation = []
+    if page > 0:
+        navigation.append(_btn("⬅️", f"u:mylist:{page - 1}"))
+    if (page + 1) * MY_PAGE_SIZE < total:
+        navigation.append(_btn("➡️", f"u:mylist:{page + 1}"))
+    if navigation:
+        keyboard.append(navigation)
+    keyboard.append([_btn("⬅️ К заявкам", "u:my")])
+    await message.answer(
+        f"Выбери заявку: {page + 1}/{(total - 1) // MY_PAGE_SIZE + 1}",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard),
+    )
+
+
+def _meta_title(row):
+    try:
+        meta = json.loads(row["source_meta"] or "{}")
+    except (TypeError, ValueError):
+        return None
+    title = (meta.get("title") or "").strip()
+    return title[:60] or None
+
+
+async def _show_my_card(message: Message, user_id: int, submission_id: int, page: int):
+    row = await _my_row(user_id, submission_id)
+    if row is None:
+        await message.answer("Заявка недоступна.")
+        return
+
+    lines = [
+        f"📋 <b>Заявка #{row['id']}</b>",
+        f"Статус: {STATUS_LABELS.get(row['status'], row['status'])}",
+        f"Тип: {'🎬 видео' if row['media_type'] == 'video' else '🖼 фото'}",
+        f"Отправлено: {format_local(row['created_at'])}",
+    ]
+
+    if row["status"] == "scheduled":
+        if row["sched_collection"]:
+            lines.append(f"Подборка: {esc(row['sched_collection'])}")
+        episode = _series_label(row["sched_season"], row["sched_episode"])
+        if episode:
+            lines.append(f"Серия: {episode}")
+        if row["publish_at"]:
+            lines.append(f"Выйдет: {format_local(row['publish_at'])}")
+    elif row["status"] == "approved":
+        if row["post_collection"]:
+            lines.append(f"Подборка: {esc(row['post_collection'])}")
+        episode = _series_label(row["post_season"], row["post_episode"])
+        if episode:
+            lines.append(f"Серия: {episode}")
+        if row["post_published_at"]:
+            lines.append(f"Опубликовано: {format_local(row['post_published_at'])}")
+    elif row["status"] == "rejected" and row["reject_reason"]:
+        lines.append(f"Причина: {esc(row['reject_reason'][:300])}")
+
+    title = _plain_title(row["sched_caption"] or row["post_caption"]) or _meta_title(row)
+    if title:
+        lines.append(f"Заголовок: {esc(title)}")
+    if row["comment_text"]:
+        lines.append(f"Комментарий: {esc(row['comment_text'][:300])}")
+
+    keyboard = []
+    if row["status"] == "approved" and row["post_message_id"]:
+        link = post_link(row["post_message_id"])
+        if link:
+            keyboard.append([_btn("🔗 Открыть пост", url=link)])
+    keyboard.append([_btn("⬅️ К списку", f"u:mylist:{page}")])
+    await message.answer("\n".join(lines), reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard))
 
 
 @router.callback_query(F.data == "u:my")
@@ -519,9 +773,102 @@ async def cb_my(callback: CallbackQuery):
     await callback.answer()
     await show_my(callback.message)
 
+
+@router.callback_query(F.data.startswith("u:mylist:"))
+async def cb_my_list(callback: CallbackQuery):
+    try:
+        page = int(callback.data.split(":")[2])
+    except (IndexError, ValueError):
+        page = 0
+    await callback.answer()
+    await _show_my_list(callback.message, callback.from_user.id, page)
+
+
+@router.callback_query(F.data.startswith("u:mycard:"))
+async def cb_my_card(callback: CallbackQuery):
+    try:
+        _, _, submission_id, page = callback.data.split(":")
+        submission_id, page = int(submission_id), int(page)
+    except ValueError:
+        await callback.answer("Некорректная кнопка", show_alert=True)
+        return
+    await callback.answer()
+    await _show_my_card(callback.message, callback.from_user.id, submission_id, page)
+
+
 @router.message(F.video | F.photo | F.animation | F.document)
 async def media_without_state(message: Message, state: FSMContext, bot: Bot):
     await submit_media(message, state, bot)
+
+
+GENERIC_LINK_ERROR = (
+    "К сожалению, не удалось загрузить видео по этой ссылке. "
+    "Возможно, публикация недоступна или источник ограничивает скачивание. "
+    "Попробуйте отправить видео файлом."
+)
+
+
+def _duplicate_text(row) -> str:
+    if row["post_message_id"]:
+        link = post_link(row["post_message_id"])
+        return f"Эта ссылка уже была в канале: {link}" if link else "Эта ссылка уже была в канале."
+    if row["status"] == "scheduled" and row["publish_at"]:
+        return f"Эта ссылка уже запланирована на {format_local(row['publish_at'])}."
+    if row["status"] == "pending":
+        return f"Эта ссылка уже на модерации (заявка #{row['id']})."
+    return "Эта ссылка уже была."
+
+
+@router.message(Submit.waiting_link)
+async def submit_link(message: Message, state: FSMContext, bot: Bot):
+    if not await db.get_bool_setting("link_upload_enabled", True):
+        await state.clear()
+        await message.answer("Загрузка по ссылкам отключена.")
+        return
+
+    text = (message.text or "").strip()
+    if not text or text.startswith("/"):
+        await message.answer("Пришли ссылку на YouTube или Instagram.")
+        return
+
+    await message.answer("Скачиваю видео…")
+
+    async def cancelled():
+        return await state.get_state() != Submit.waiting_link.state
+
+    try:
+        submission_id = await link_flow.download_and_submit(
+            bot, message.from_user, text, cancelled
+        )
+    except link_flow.LinkCancelled:
+        return
+    except link_flow.LinkDuplicate as error:
+        error_text = _duplicate_text(error.row)
+    except (link_download.InvalidLink, link_download.UnsupportedSource):
+        error_text = "Поддерживаются только ссылки на YouTube и Instagram."
+    except link_download.LinkBusy:
+        error_text = "Эта ссылка уже скачивается. Подожди немного."
+    except link_download.TooLarge:
+        error_text = "Видео больше 50 МБ — Telegram не даст его опубликовать. Пришли файлом."
+    except link_download.TooLong:
+        error_text = "Видео длиннее 10 минут. Пришли файлом."
+    except link_flow.LinkUploadFailed:
+        error_text = "Видео скачано, но не удалось передать его в модерацию. Попробуй позже."
+    except link_download.LinkError:
+        error_text = GENERIC_LINK_ERROR
+    except Exception:  # noqa: BLE001
+        log.exception("unexpected link submission error")
+        error_text = GENERIC_LINK_ERROR
+    else:
+        await state.clear()
+        await message.answer(f"Заявка #{submission_id} принята. Сообщу, когда её посмотрят.")
+        await main_menu(message, message.chat.id)
+        return
+    finally:
+        if await state.get_state() == Submit.waiting_link.state:
+            await state.clear()
+
+    await message.answer(error_text, parse_mode=None)
 
 
 @router.message(F.text)

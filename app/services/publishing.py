@@ -1,5 +1,8 @@
 import asyncio
+import html
+import json
 import logging
+import re
 
 from aiogram import Bot
 from aiogram.exceptions import (
@@ -16,6 +19,46 @@ from app.services import collections as collections_service
 from app.utils import esc, format_local, now_iso, post_link
 
 log = logging.getLogger(__name__)
+
+_URL_RE = re.compile(r"https?://[^\s<>]+")
+
+
+def _format_line(line: str) -> str:
+    parts = []
+    last = 0
+    for match in _URL_RE.finditer(line):
+        parts.append(esc(line[last:match.start()]))
+        url = match.group(0)
+        parts.append(f'<i><a href="{html.escape(url, quote=True)}">{esc(url)}</a></i>')
+        last = match.end()
+    parts.append(esc(line[last:]))
+    return "".join(parts)
+
+
+def format_caption_text(raw) -> str:
+    raw = (raw or "").strip()
+    if not raw:
+        return ""
+    if len(raw) > 900:
+        raw = raw[:897] + "..."
+    lines = raw.splitlines()
+    while lines and not lines[0].strip():
+        lines.pop(0)
+    while lines and not lines[-1].strip():
+        lines.pop()
+    if not lines:
+        return ""
+
+    first = lines[0].strip()
+    if first.startswith("#") or _URL_RE.fullmatch(first):
+        body_lines = lines
+    else:
+        title = f"<b>{esc(first)}</b>"
+        body_lines = lines[1:]
+        body = "\n".join(_format_line(line) for line in body_lines).strip("\n")
+        return f"{title}\n\n{body}" if body else title
+
+    return "\n".join(_format_line(line) for line in body_lines).strip("\n")
 
 AMBIGUOUS_ERRORS = (asyncio.TimeoutError, TimeoutError, TelegramNetworkError, TelegramServerError)
 
@@ -86,10 +129,7 @@ def post_keyboard(prev_link=None, next_link=None, random_enabled=False) -> Inlin
 
 def card_keyboard(submission_id: int, author_id=None) -> InlineKeyboardMarkup:
     rows = [
-        [
-            InlineKeyboardButton(text="✅ Опубликовать", callback_data=f"mod:pub:{submission_id}"),
-            InlineKeyboardButton(text="📁 В подборку", callback_data=f"mod:col:{submission_id}"),
-        ],
+        [InlineKeyboardButton(text="✅ Опубликовать", callback_data=f"mod:pub:{submission_id}")],
         [InlineKeyboardButton(text="❌ Отклонить", callback_data=f"mod:rej:{submission_id}")],
     ]
     if author_id is not None and not config.is_admin(author_id):
@@ -110,20 +150,17 @@ def random_keyboard() -> InlineKeyboardMarkup:
 
 
 def build_caption(text, collection, season, episode) -> str:
-    raw = (text or "").strip()
-    if len(raw) > 900:
-        raw = raw[:897] + "..."
-    text = esc(raw)
+    body = format_caption_text(text)
     tag = ""
     if collection is not None:
         tag = f"#{collection['slug']}"
         if collection["is_ordered"] and episode:
             tag += f" · S{int(season or collection['season'])}E{int(episode)}"
-    if tag and text and tag.split(" ")[0] in text:
-        return text
-    if text and tag:
-        return f"{text}\n\n{tag}"
-    return text or tag
+    if tag and body and tag.split(" ")[0] in body:
+        return body
+    if body and tag:
+        return f"{body}\n\n{tag}"
+    return body or tag
 
 
 async def neighbour_posts(post_row):
@@ -238,6 +275,15 @@ async def _publish_claimed(bot: Bot, submission, submission_id: int, caption_tex
         else:
             season = None
             episode = None
+
+    if caption_text is None and submission["source_url"]:
+        try:
+            source_meta = json.loads(submission["source_meta"] or "{}")
+        except (TypeError, ValueError):
+            source_meta = {}
+        source_title = (source_meta.get("title") or "").strip()
+        if source_title:
+            caption_text = source_title
 
     caption = build_caption(caption_text, collection, season, episode)
     prev_link = next_link = None

@@ -105,12 +105,18 @@ async def card_action(callback: CallbackQuery, bot: Bot):
     admin_id = callback.from_user.id
 
     if action == "pub":
-        await sessions.set_session(admin_id, step="caption", submission_id=submission_id,
-                                   collection_id=None, season=None, episode=None, caption=None)
-        ok = await _dm(bot, admin_id,
-                       f"Заявка #{submission_id}. Пришли текст подписи к посту или /skip.",
-                       cancel_kb, reply_to=callback.message.message_id,
-                       mention=callback.from_user.mention_html())
+        await sessions.set_session(admin_id, step="destination", submission_id=submission_id)
+        ok = await _dm(
+            bot,
+            admin_id,
+            f"Заявка #{submission_id}. Куда опубликовать?",
+            InlineKeyboardMarkup(inline_keyboard=[
+                [_btn("📁 В подборку", "mod:where:col"), _btn("📄 Без подборки", "mod:where:none")],
+                [_btn("✖️ Отмена", "flow:cancel")],
+            ]),
+            reply_to=callback.message.message_id,
+            mention=callback.from_user.mention_html(),
+        )
         if not ok:
             await callback.answer("Открой бота в личке и нажми /start", show_alert=True)
         else:
@@ -147,17 +153,11 @@ async def card_action(callback: CallbackQuery, bot: Bot):
 
     if action == "col":
         await sessions.set_session(admin_id, step="pick", submission_id=submission_id)
-        rows = await db.fetchall("SELECT * FROM collections ORDER BY position, id")
-        keyboard = []
-        for row in rows:
-            mark = "📺" if row["is_ordered"] else "📁"
-            keyboard.append([_btn(f"{mark} {row['name']}", f"pick:{submission_id}:{row['id']}")])
-        keyboard.append([_btn("➕ Новая подборка", f"picknew:{submission_id}")])
-        keyboard.append([_btn("✖️ Отмена", "flow:cancel")])
-        ok = await _dm(bot, admin_id, f"Заявка #{submission_id}. В какую подборку?",
-                       InlineKeyboardMarkup(inline_keyboard=keyboard),
-                       reply_to=callback.message.message_id,
-                       mention=callback.from_user.mention_html())
+        ok = await _send_collection_picker(
+            bot, admin_id, submission_id,
+            reply_to=callback.message.message_id,
+            mention=callback.from_user.mention_html(),
+        )
         if not ok:
             await callback.answer("Открой бота в личке и нажми /start", show_alert=True)
         else:
@@ -165,6 +165,46 @@ async def card_action(callback: CallbackQuery, bot: Bot):
         return
 
     await callback.answer()
+
+
+async def _send_collection_picker(bot: Bot, admin_id: int, submission_id: int,
+                                   reply_to=None, mention=None) -> bool:
+    rows = await db.fetchall("SELECT * FROM collections ORDER BY position, id")
+    keyboard = []
+    for row in rows:
+        mark = "📺" if row["is_ordered"] else "📁"
+        keyboard.append([_btn(f"{mark} {row['name']}", f"pick:{submission_id}:{row['id']}")])
+    keyboard.append([_btn("➕ Новая подборка", f"picknew:{submission_id}")])
+    keyboard.append([_btn("✖️ Отмена", "flow:cancel")])
+    return await _dm(
+        bot, admin_id, f"Заявка #{submission_id}. В какую подборку?",
+        InlineKeyboardMarkup(inline_keyboard=keyboard),
+        reply_to=reply_to, mention=mention,
+    )
+
+
+@router.callback_query(F.data.startswith("mod:where:"))
+async def choose_destination(callback: CallbackQuery, bot: Bot):
+    if await _deny(callback):
+        return
+    session = await sessions.get_session(callback.from_user.id)
+    if not session or session.get("step") != "destination":
+        await callback.answer("Сессия устарела, начни заново", show_alert=True)
+        return
+    submission_id = int(session["submission_id"])
+    destination = callback.data.split(":")[2]
+    if destination == "col":
+        await sessions.update_session(callback.from_user.id, step="pick")
+        await callback.answer()
+        await _send_collection_picker(bot, callback.from_user.id, submission_id)
+        return
+
+    await sessions.update_session(callback.from_user.id, step="caption", collection_id=None,
+                                  season=None, episode=None, caption=None)
+    await callback.answer()
+    await _dm(bot, callback.from_user.id,
+              f"Заявка #{submission_id}. Пришли текст подписи к посту или /skip.",
+              cancel_kb)
 
 
 @router.callback_query(F.data.startswith("pick:"))

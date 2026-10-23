@@ -52,15 +52,37 @@ def local_now() -> datetime:
     return datetime.now(ZoneInfo(config.TIMEZONE))
 
 
-def format_local(iso_value) -> str:
+def _local_dt(iso_value):
     if not iso_value:
-        return "?"
+        return None
     try:
         dt = datetime.fromisoformat(str(iso_value))
     except ValueError:
-        return str(iso_value)
-    local = dt.replace(tzinfo=timezone.utc).astimezone(ZoneInfo(config.TIMEZONE))
+        return None
+    return dt.replace(tzinfo=timezone.utc).astimezone(ZoneInfo(config.TIMEZONE))
+
+
+def format_local(iso_value) -> str:
+    local = _local_dt(iso_value)
+    if local is None:
+        return "?" if not iso_value else str(iso_value)
     return local.strftime("%d.%m.%Y %H:%M")
+
+
+def format_local_day(iso_value) -> str:
+    local = _local_dt(iso_value)
+    if local is None:
+        return "?"
+    if local.year != datetime.now(ZoneInfo(config.TIMEZONE)).year:
+        return local.strftime("%d.%m.%Y")
+    return local.strftime("%d.%m")
+
+
+def format_local_short(iso_value) -> str:
+    local = _local_dt(iso_value)
+    if local is None:
+        return "?"
+    return local.strftime("%d.%m %H:%M")
 
 
 def _to_utc(dt: datetime) -> str:
