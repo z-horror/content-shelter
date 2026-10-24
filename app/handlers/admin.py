@@ -901,8 +901,9 @@ async def on_post_caption(message: Message, state: FSMContext, bot: Bot):
         await message.answer(f"Не удалось изменить подпись: {esc(error)}")
         return
     await db.execute("UPDATE posts SET caption = ? WHERE id = ?", (caption, post["id"]))
+    await publishing.refresh_keyboard(bot, post)
     await state.clear()
-    await message.answer("Подпись обновлена.")
+    await message.answer("Подпись обновлена, кнопки восстановлены.")
 
 
 @router.callback_query(F.data.startswith("ap:hide:"), IsAdmin())

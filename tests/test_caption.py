@@ -70,3 +70,27 @@ def test_file_submission_without_caption_keeps_old_behavior():
             await db.close()
 
     asyncio.run(scenario())
+
+
+def test_refresh_keyboard_restores_buttons_for_unordered_post():
+    async def scenario():
+        await db.init()
+        try:
+            bot = FakeBot()
+            post = {
+                "channel_id": -1001111111111,
+                "message_id": 42,
+                "collection_id": None,
+                "season": None,
+                "episode": None,
+            }
+            await publishing.refresh_keyboard(bot, post)
+            assert bot.markups
+            keyboard = bot.markups[-1][2]
+            urls = [button.url for row in keyboard.inline_keyboard for button in row if button.url]
+            assert any("start=submit" in url for url in urls)
+            assert any("start=collections" in url for url in urls)
+        finally:
+            await db.close()
+
+    asyncio.run(scenario())

@@ -181,11 +181,13 @@ async def neighbour_posts(post_row):
 
 
 async def refresh_keyboard(bot: Bot, post_row):
-    if not post_row or not post_row["collection_id"] or not post_row["episode"]:
+    if not post_row:
         return
-    previous, following = await neighbour_posts(post_row)
-    prev_link = post_link(previous["message_id"]) if previous else None
-    next_link = post_link(following["message_id"]) if following else None
+    prev_link = next_link = None
+    if post_row["collection_id"] and post_row["episode"]:
+        previous, following = await neighbour_posts(post_row)
+        prev_link = post_link(previous["message_id"]) if previous else None
+        next_link = post_link(following["message_id"]) if following else None
     random_enabled = await db.get_bool_setting("random_button_under_posts")
     try:
         await bot.edit_message_reply_markup(

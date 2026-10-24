@@ -19,6 +19,7 @@ class FakeBot:
         self.deleted = []
         self.messages = []
         self.sent = []
+        self.markups = []
         self.send_error = send_error
 
     async def copy_message(self, **kwargs):
@@ -35,6 +36,7 @@ class FakeBot:
         self.deleted.append((chat_id, message_id))
 
     async def edit_message_reply_markup(self, **kwargs):
+        self.markups.append((kwargs.get("chat_id"), kwargs.get("message_id"), kwargs.get("reply_markup")))
         return None
 
     async def edit_message_caption(self, **kwargs):
